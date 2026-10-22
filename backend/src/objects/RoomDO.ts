@@ -60,9 +60,22 @@ export class RoomDO {
     try {
       this.state.storage.sql.exec("ALTER TABLE messages ADD COLUMN parent_id TEXT");
     } catch {}
+
+    // Safe index creation after columns are guaranteed to exist
+    try {
+      this.state.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at ASC)");
+    } catch {}
     try {
       this.state.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id)");
+    } catch {}
+    try {
       this.state.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_messages_room_parent ON messages(room_id, parent_id, created_at ASC)");
+    } catch {}
+    try {
+      this.state.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_reactions_msg ON reactions(message_id)");
+    } catch {}
+    try {
+      this.state.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_room_members_user ON room_members(user_id)");
     } catch {}
 
     // Derive deterministic AES-256-GCM key for this room

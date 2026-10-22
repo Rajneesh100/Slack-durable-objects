@@ -35,12 +35,6 @@ CREATE TABLE IF NOT EXISTS reactions (
   emoji TEXT NOT NULL,
   PRIMARY KEY (message_id, user_id, emoji)
 );
-
-CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at ASC);
-CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id);
-CREATE INDEX IF NOT EXISTS idx_messages_room_parent ON messages(room_id, parent_id, created_at ASC);
-CREATE INDEX IF NOT EXISTS idx_reactions_msg ON reactions(message_id);
-CREATE INDEX IF NOT EXISTS idx_room_members_user ON room_members(user_id);
 `;
 
 export interface MessageRow {
