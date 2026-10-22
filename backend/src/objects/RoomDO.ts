@@ -437,6 +437,25 @@ export class RoomDO {
               lastReplyAt: effect.message.createdAt,
             });
           }
+
+          // Broadcast channel activity to global UserDO for cross-channel unread highlights
+          if (this.env?.USERS) {
+            try {
+              const userStub = this.env.USERS.get(this.env.USERS.idFromName("global_user_registry"));
+              userStub
+                .fetch("http://internal/activity/record", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    roomId: effect.message.roomId,
+                    senderName: effect.message.senderName,
+                    snippet: effect.message.content.slice(0, 100),
+                    timestamp: effect.message.createdAt,
+                  }),
+                })
+                .catch(() => {});
+            } catch {}
+          }
           break;
         }
 

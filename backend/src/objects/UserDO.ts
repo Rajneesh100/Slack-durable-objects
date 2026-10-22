@@ -90,6 +90,12 @@ export class UserDO {
       if (request.method === "GET" && path === "/channels/resolve-invite") {
         return await this.handleResolveInvite(url);
       }
+      if (request.method === "POST" && path === "/activity/record") {
+        return await this.handleRecordActivity(request);
+      }
+      if (request.method === "GET" && path === "/activity/feed") {
+        return await this.handleActivityFeed();
+      }
 
       return new Response(JSON.stringify({ error: "Endpoint not found" }), {
         status: 404,
@@ -351,6 +357,49 @@ export class UserDO {
         JSON.stringify(Array.from(channels)),
         userId
       );
+    }
+  }
+
+  private async handleRecordActivity(request: Request): Promise<Response> {
+    try {
+      const body = (await request.json()) as {
+        roomId?: string;
+        senderName?: string;
+        snippet?: string;
+        timestamp?: number;
+      };
+      if (body.roomId) {
+        this.state.storage.sql.exec(
+          "INSERT OR REPLACE INTO channel_activity (room_id, last_message_at, last_sender, snippet) VALUES (?, ?, ?, ?)",
+          body.roomId,
+          body.timestamp || Date.now(),
+          body.senderName || "Unknown",
+          body.snippet || ""
+        );
+      }
+      return Response.json({ success: true });
+    } catch {
+      return Response.json({ success: false });
+    }
+  }
+
+  private async handleActivityFeed(): Promise<Response> {
+    try {
+      const rows = this.state.storage.sql
+        .exec("SELECT room_id, last_message_at, last_sender, snippet FROM channel_activity")
+        .toArray() as unknown as { room_id: string; last_message_at: number; last_sender: string; snippet: string }[];
+
+      const activities: Record<string, { lastMessageAt: number; lastSender: string; snippet: string }> = {};
+      for (const r of rows) {
+        activities[r.room_id] = {
+          lastMessageAt: r.last_message_at,
+          lastSender: r.last_sender,
+          snippet: r.snippet,
+        };
+      }
+      return Response.json({ activities });
+    } catch {
+      return Response.json({ activities: {} });
     }
   }
 

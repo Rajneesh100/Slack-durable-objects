@@ -52,6 +52,15 @@ interface AlertToast {
   readonly channelId: string;
 }
 
+interface MentionItem {
+  readonly id: string;
+  readonly roomId: string;
+  readonly roomName: string;
+  readonly senderName: string;
+  readonly content: string;
+  readonly createdAt: number;
+}
+
 interface AppState {
   readonly user: { readonly id: string; readonly username: string } | null;
   readonly token: string | null;
@@ -73,6 +82,9 @@ interface AppState {
   readonly pendingAttachment: FileAttachment | null;
   readonly threadPendingAttachment: FileAttachment | null;
   readonly unreadChannels: Readonly<Record<string, number>>;
+  readonly channelMentions: Readonly<Record<string, boolean>>;
+  readonly mentions: readonly MentionItem[];
+  readonly isViewingMentions: boolean;
   readonly alertToast: AlertToast | null;
   readonly mentionQuery: string | null;
   readonly isChannelForbidden: boolean;
@@ -368,6 +380,9 @@ let state: AppState = {
   pendingAttachment: null,
   threadPendingAttachment: null,
   unreadChannels: {},
+  channelMentions: {},
+  mentions: [],
+  isViewingMentions: false,
   alertToast: null,
   mentionQuery: null,
   isChannelForbidden: false,
@@ -378,9 +393,12 @@ let state: AppState = {
 };
 
 interface OutboxMessage {
+  readonly clientMsgId: string;
   readonly content: string;
   readonly attachment?: FileAttachment;
   readonly parentId?: string;
+  readonly channelId: string;
+  readonly sentAt: number;
 }
 
 let activeSocket: WebSocket | null = null;
@@ -390,22 +408,32 @@ let heartbeatInterval: number | null = null;
 let reconnectTimeout: number | null = null;
 let reconnectAttempts = 0;
 let lastTypingSent = 0;
+let lastPongReceivedAt = Date.now();
+let activityPollInterval: number | null = null;
+let lastReadTimestamps: Record<string, number> = {};
+let isInternalHashChange = false;
 let pendingOutbox: OutboxMessage[] = [];
 
 const startHeartbeat = (): void => {
   if (heartbeatInterval) clearInterval(heartbeatInterval);
   heartbeatInterval = window.setInterval(() => {
+    const now = Date.now();
     if (activeSocket && activeSocket.readyState === WebSocket.OPEN) {
+      if (now - lastPongReceivedAt > 30000) {
+        console.warn("WebSocket heartbeat timed out (>30s no pong), reconnecting...");
+        checkAndHealWebSocket();
+        return;
+      }
       try {
         activeSocket.send(JSON.stringify({ type: "PING" }));
       } catch (err) {
         console.warn("Heartbeat send error, triggering reconnect:", err);
-        ensureWebSocketConnected();
+        checkAndHealWebSocket();
       }
-    } else if (!activeSocket || activeSocket.readyState === WebSocket.CLOSED) {
-      ensureWebSocketConnected();
+    } else {
+      checkAndHealWebSocket();
     }
-  }, 20000); // 20s avoids Cloudflare 100s idle timeout
+  }, 15000); // 15s keeps Cloudflare DO alive and detects drops fast
 };
 
 const stopHeartbeat = (): void => {
@@ -419,7 +447,7 @@ const scheduleReconnect = (channelId: string, token: string): void => {
   if (reconnectTimeout) clearTimeout(reconnectTimeout);
   if (!state.user || !state.token || state.isChannelForbidden) return;
 
-  const delay = Math.min(1000 * Math.pow(1.5, reconnectAttempts), 8000);
+  const delay = Math.min(800 * Math.pow(1.4, reconnectAttempts), 6000);
   reconnectAttempts++;
 
   reconnectTimeout = window.setTimeout(() => {
@@ -427,14 +455,26 @@ const scheduleReconnect = (channelId: string, token: string): void => {
   }, delay);
 };
 
-const ensureWebSocketConnected = (): void => {
+const checkAndHealWebSocket = (): void => {
   if (!state.user || !state.token || state.isChannelForbidden) return;
-  if (!activeSocket || activeSocket.readyState === WebSocket.CLOSED || activeSocket.readyState === WebSocket.CLOSING) {
+  const now = Date.now();
+  const isStale = now - lastPongReceivedAt > 22000;
+  const isDead = !activeSocket || activeSocket.readyState === WebSocket.CLOSED || activeSocket.readyState === WebSocket.CLOSING;
+
+  if (isDead || isStale) {
     connectWebSocket(state.activeChannelId, state.token);
+  } else if (activeSocket && activeSocket.readyState === WebSocket.OPEN) {
+    try {
+      activeSocket.send(JSON.stringify({ type: "PING" }));
+    } catch {
+      connectWebSocket(state.activeChannelId, state.token);
+    }
   }
 };
 
-// Update state and trigger re-render while NEVER losing user's typed drafts
+
+
+// Update state and trigger re-render while NEVER losing user's typed drafts or scroll positions
 const updateState = (updater: (prev: AppState) => AppState): void => {
   const mainInput = document.getElementById("chat-input") as HTMLTextAreaElement | null;
   const threadInput = document.getElementById("thread-chat-input") as HTMLTextAreaElement | null;
@@ -446,6 +486,12 @@ const updateState = (updater: (prev: AppState) => AppState): void => {
   if (threadInput && state.activeThreadParentId) {
     currentDrafts[`thread:${state.activeThreadParentId}`] = threadInput.value;
   }
+
+  // Preserve scroll positions to eliminate jump/flicker
+  const messagesStream = document.getElementById("messages-stream");
+  const threadStream = document.getElementById("thread-messages-stream");
+  const chatScrollTop = messagesStream ? messagesStream.scrollTop : null;
+  const threadScrollTop = threadStream ? threadStream.scrollTop : null;
 
   // Preserve focus and selection
   const activeEl = document.activeElement;
@@ -459,6 +505,16 @@ const updateState = (updater: (prev: AppState) => AppState): void => {
 
   state = updater({ ...state, drafts: currentDrafts });
   renderApp();
+
+  // Restore scroll positions accurately
+  if (chatScrollTop !== null) {
+    const newChat = document.getElementById("messages-stream");
+    if (newChat) newChat.scrollTop = chatScrollTop;
+  }
+  if (threadScrollTop !== null) {
+    const newThread = document.getElementById("thread-messages-stream");
+    if (newThread) newThread.scrollTop = threadScrollTop;
+  }
 
   // Restore focus and cursor seamlessly
   if (focusedId) {
@@ -528,6 +584,7 @@ const connectWebSocket = (channelId: string, token: string): void => {
 
   ws.onopen = () => {
     reconnectAttempts = 0;
+    lastPongReceivedAt = Date.now();
     startHeartbeat();
     updateState((s) => ({ ...s, isConnecting: false, isChannelForbidden: false }));
 
@@ -536,34 +593,41 @@ const connectWebSocket = (channelId: string, token: string): void => {
       const messagesToSend = [...pendingOutbox];
       pendingOutbox = [];
       for (const m of messagesToSend) {
-        try {
-          ws.send(
-            JSON.stringify({
-              type: "SEND_MESSAGE",
-              content: m.content,
-              attachment: m.attachment,
-              parentId: m.parentId,
-            })
-          );
-        } catch (err) {
-          console.error("Error flushing message:", err);
-          pendingOutbox.push(m);
+        if (m.channelId === state.activeChannelId) {
+          try {
+            ws.send(
+              JSON.stringify({
+                type: "SEND_MESSAGE",
+                content: m.content,
+                attachment: m.attachment,
+                parentId: m.parentId,
+              })
+            );
+          } catch (err) {
+            console.error("Error flushing message:", err);
+            pendingOutbox.push(m);
+          }
         }
       }
     }
   };
 
   ws.onmessage = (event) => {
+    lastPongReceivedAt = Date.now();
     try {
       const data = JSON.parse(event.data);
 
       switch (data.type) {
         case "PONG": {
-          // Heartbeat ack from Durable Object
+          lastPongReceivedAt = Date.now();
+          if (state.isConnecting) {
+            updateState((s) => ({ ...s, isConnecting: false }));
+          }
           break;
         }
 
         case "ROOM_SNAPSHOT": {
+          lastReadTimestamps[channelId] = Date.now();
           updateState((s) => ({
             ...s,
             messages: data.messages || [],
@@ -582,12 +646,39 @@ const connectWebSocket = (channelId: string, token: string): void => {
             const myTag = `@${state.user.username.toLowerCase()}`;
             if (msg.content.toLowerCase().includes(myTag)) {
               const ch = state.channels.find((c) => c.id === msg.roomId);
+              const roomName = ch?.name || msg.roomId;
               showSlackAlertToast(
-                `@${msg.senderName} mentioned you in #${ch?.name || "channel"}`,
+                `@${msg.senderName} mentioned you in #${roomName}`,
                 msg.content,
                 msg.roomId
               );
-              document.title = `(🔔 1) Slack — #${ch?.name || "chat"}`;
+              document.title = `(🔔 1) Slack — #${roomName}`;
+
+              // Add to mentions and channel mention badge
+              updateState((s) => {
+                const exists = s.mentions.some((m) => m.id === msg.id);
+                const nextMentions = exists
+                  ? s.mentions
+                  : [
+                      {
+                        id: msg.id,
+                        roomId: msg.roomId,
+                        roomName,
+                        senderName: msg.senderName,
+                        content: msg.content,
+                        createdAt: msg.createdAt,
+                      },
+                      ...s.mentions,
+                    ];
+                return {
+                  ...s,
+                  channelMentions: {
+                    ...s.channelMentions,
+                    [msg.roomId]: true,
+                  },
+                  mentions: nextMentions,
+                };
+              });
             }
           }
 
@@ -728,25 +819,36 @@ const sendChatMessage = (content: string, parentId?: string): void => {
   const attachment = parentId ? state.threadPendingAttachment : state.pendingAttachment;
   if (trimmed.length === 0 && !attachment) return;
 
-  const payload = {
-    type: "SEND_MESSAGE",
+  const clientMsgId = "msg_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7);
+  const outboxItem: OutboxMessage = {
+    clientMsgId,
     content: trimmed,
     attachment: attachment || undefined,
     parentId,
+    channelId: state.activeChannelId,
+    sentAt: Date.now(),
   };
 
-  // If connected, transmit immediately; otherwise queue into outbox so message is NEVER lost!
-  if (activeSocket && activeSocket.readyState === WebSocket.OPEN) {
+  const isStale = Date.now() - lastPongReceivedAt > 22000;
+
+  if (activeSocket && activeSocket.readyState === WebSocket.OPEN && !isStale) {
     try {
-      activeSocket.send(JSON.stringify(payload));
+      activeSocket.send(
+        JSON.stringify({
+          type: "SEND_MESSAGE",
+          content: trimmed,
+          attachment: attachment || undefined,
+          parentId,
+        })
+      );
     } catch (err) {
       console.warn("Socket send failed, queueing message in outbox:", err);
-      pendingOutbox.push({ content: trimmed, attachment: attachment || undefined, parentId });
-      ensureWebSocketConnected();
+      pendingOutbox.push(outboxItem);
+      checkAndHealWebSocket();
     }
   } else {
-    pendingOutbox.push({ content: trimmed, attachment: attachment || undefined, parentId });
-    ensureWebSocketConnected();
+    pendingOutbox.push(outboxItem);
+    checkAndHealWebSocket();
   }
 
   if (parentId) {
@@ -1198,13 +1300,17 @@ const handleCopyInviteLink = async (): Promise<void> => {
 };
 
 const switchChannel = (channelId: string): void => {
-  if (state.activeChannelId === channelId && !state.isChannelForbidden) return;
+  if (state.activeChannelId === channelId && !state.isChannelForbidden && !state.isViewingMentions) return;
 
-  // Clear unread badge for this channel
+  // Clear unread badge and mention badge for this channel
   const nextUnread = { ...state.unreadChannels };
   delete nextUnread[channelId];
+  const nextChannelMentions = { ...state.channelMentions };
+  delete nextChannelMentions[channelId];
+  lastReadTimestamps[channelId] = Date.now();
 
   document.title = "Slack — Durable Objects";
+  isInternalHashChange = true;
   window.location.hash = `channel=${channelId}`;
 
   const isPublic = channelId === "general" || channelId === "random";
@@ -1213,16 +1319,29 @@ const switchChannel = (channelId: string): void => {
   updateState((s) => ({
     ...s,
     activeChannelId: channelId,
-    isChannelForbidden: !isMember && state.channels.length > 0,
+    messages: [], // Clear old channel's messages immediately!
+    activeThreadParentId: null, // CLOSE the thread pane so other channels' threads don't linger!
+    threadMessages: [],
+    isThreadLoading: false,
+    threadPendingAttachment: null,
+    pendingAttachment: null,
     showEmojiPicker: false,
+    showThreadEmojiPicker: false,
+    isViewingMentions: false,
+    isChannelForbidden: !isMember && state.channels.length > 0,
     mentionQuery: null,
     unreadChannels: nextUnread,
+    channelMentions: nextChannelMentions,
   }));
 
   if (state.token) connectWebSocket(channelId, state.token);
 };
 
 const checkHashRoute = (): void => {
+  if (isInternalHashChange) {
+    isInternalHashChange = false;
+    return;
+  }
   const hash = window.location.hash.slice(1);
   const params = new URLSearchParams(hash);
 
@@ -1234,13 +1353,28 @@ const checkHashRoute = (): void => {
 
   const channelId = params.get("channel");
   if (channelId) {
+    if (channelId === state.activeChannelId && !state.isChannelForbidden && !state.isViewingMentions) return;
+
     const isPublic = channelId === "general" || channelId === "random";
     const isMember = isPublic || state.channels.some((c) => c.id === channelId);
+
+    const nextUnread = { ...state.unreadChannels };
+    delete nextUnread[channelId];
+    const nextChannelMentions = { ...state.channelMentions };
+    delete nextChannelMentions[channelId];
+    lastReadTimestamps[channelId] = Date.now();
 
     updateState((s) => ({
       ...s,
       activeChannelId: channelId,
+      messages: [],
+      activeThreadParentId: null, // CLOSE thread pane on route change!
+      threadMessages: [],
+      isThreadLoading: false,
+      isViewingMentions: false,
       isChannelForbidden: !isMember && state.channels.length > 0,
+      unreadChannels: nextUnread,
+      channelMentions: nextChannelMentions,
     }));
     if (state.token) connectWebSocket(channelId, state.token);
     return;
@@ -1646,6 +1780,60 @@ const renderThreadPanel = (): string => {
   `;
 };
 
+const renderMentionsPane = (): string => `
+  <section class="mentions-pane" id="mentions-pane">
+    ${
+      state.alertToast
+        ? `
+        <div class="slack-alert-toast" id="slack-alert-banner" data-channel-id="${state.alertToast.channelId}">
+          <div class="slack-alert-icon">🔔</div>
+          <div class="slack-alert-content">
+            <span class="slack-alert-title">${escapeHtml(state.alertToast.title)}</span>
+            <span class="slack-alert-snippet">${escapeHtml(state.alertToast.snippet)}</span>
+          </div>
+        </div>
+      `
+        : ""
+    }
+    <header class="mentions-header">
+      <h2><span>🔔</span> Mentions & Reactions</h2>
+    </header>
+    <div class="mentions-list">
+      ${
+        state.mentions.length === 0
+          ? `
+          <div style="margin: auto; text-align: center; color: var(--text-muted); padding: 60px 20px;">
+            <div style="font-size: 36px; margin-bottom: 12px;">🔔</div>
+            <h3 style="color: #fff; margin-bottom: 6px;">No mentions yet</h3>
+            <p>When someone mentions you with @${escapeHtml(state.user?.username || "username")}, you'll find it here.</p>
+          </div>
+        `
+          : state.mentions
+              .map(
+                (m) => `
+          <div class="mention-card" data-channel-id="${m.roomId}">
+            <div class="mention-card-meta">
+              <span class="mention-card-channel">#${escapeHtml(m.roomName)}</span>
+              <span class="mention-card-time">${formatRelativeTime(m.createdAt)}</span>
+            </div>
+            <div class="mention-card-header">
+              <div class="avatar" style="width:24px;height:24px;font-size:11px;background:${getAvatarGradient(m.senderName)};">
+                ${getInitials(m.senderName)}
+              </div>
+              <span class="mention-card-sender">${escapeHtml(m.senderName)}</span>
+            </div>
+            <div class="mention-card-body">
+              ${formatMessageText(m.content, state.user?.username)}
+            </div>
+          </div>
+        `
+              )
+              .join("")
+      }
+    </div>
+  </section>
+`;
+
 const renderSlackApp = (): string => {
   const currentChannel = state.channels.find((c) => c.id === state.activeChannelId) || {
     id: state.activeChannelId,
@@ -1687,6 +1875,24 @@ const renderSlackApp = (): string => {
         </div>
 
         <div class="sidebar-content">
+          <!-- Sidebar Activity Section: Bell icon like Slack -->
+          <div class="sidebar-activity-section">
+            <button
+              type="button"
+              id="open-mentions-btn"
+              class="activity-nav-item ${state.isViewingMentions ? "active" : ""}"
+              title="Mentions & Reactions"
+            >
+              <span class="activity-icon">🔔</span>
+              <span class="activity-label">Mentions & Reactions</span>
+              ${
+                state.mentions.length > 0
+                  ? `<span class="activity-badge">${state.mentions.length}</span>`
+                  : ""
+              }
+            </button>
+          </div>
+
           <div>
             <div class="channel-section-header">
               <span>Channels</span>
@@ -1699,16 +1905,23 @@ const renderSlackApp = (): string => {
               ${state.channels
                 .map((ch) => {
                   const unread = state.unreadChannels[ch.id] || 0;
-                  const isActive = ch.id === state.activeChannelId;
+                  const hasMention = !!state.channelMentions[ch.id];
+                  const isActive = !state.isViewingMentions && ch.id === state.activeChannelId;
                   return `
                     <a
                       href="#channel=${ch.id}"
-                      class="channel-item ${isActive ? "active" : ""} ${unread > 0 ? "has-unread" : ""}"
+                      class="channel-item ${isActive ? "active" : ""} ${unread > 0 ? "has-unread" : ""} ${hasMention ? "has-mention" : ""}"
                       data-channel-id="${ch.id}"
                     >
                       <span class="channel-hash">#</span>
                       <span class="channel-name">${escapeHtml(ch.name)}</span>
-                      ${unread > 0 ? `<span class="channel-unread-badge">${unread}</span>` : ""}
+                      ${
+                        hasMention
+                          ? `<span class="channel-mention-badge">@</span>`
+                          : unread > 0
+                          ? `<span class="channel-unread-badge">${unread}</span>`
+                          : ""
+                      }
                     </a>
                   `;
                 })
@@ -1739,7 +1952,11 @@ const renderSlackApp = (): string => {
         </footer>
       </aside>
 
-      <!-- Main Chat Area -->
+      <!-- Main Content Area: Either Mentions View or Channel Chat -->
+      ${
+        state.isViewingMentions
+          ? renderMentionsPane()
+          : `
       <section class="chat-pane" id="chat-pane-container">
         <!-- Floating Alert Banner -->
         ${
@@ -1918,9 +2135,11 @@ const renderSlackApp = (): string => {
           `
         }
       </section>
+        `
+      }
 
       <!-- Slack Thread Side Panel (if open) -->
-      ${state.activeThreadParentId ? renderThreadPanel() : ""}
+      ${!state.isViewingMentions && state.activeThreadParentId ? renderThreadPanel() : ""}
     </div>
 
     <!-- Modals -->
@@ -2052,6 +2271,30 @@ const bindEvents = (): void => {
       }));
     };
   }
+
+  // Sidebar Mentions & Reactions Navigation
+  const openMentionsBtn = document.getElementById("open-mentions-btn");
+  if (openMentionsBtn) {
+    openMentionsBtn.onclick = () => {
+      updateState((s) => ({
+        ...s,
+        isViewingMentions: true,
+        activeThreadParentId: null,
+        threadMessages: [],
+        showEmojiPicker: false,
+        showThreadEmojiPicker: false,
+      }));
+    };
+  }
+
+  // Mention Cards in Mentions Pane
+  const mentionCards = document.querySelectorAll<HTMLElement>(".mention-card");
+  mentionCards.forEach((card) => {
+    card.onclick = () => {
+      const chId = card.getAttribute("data-channel-id");
+      if (chId) switchChannel(chId);
+    };
+  });
 
   // Channel Item Navigation
   const channelLinks = document.querySelectorAll<HTMLElement>(".channel-item");
@@ -2419,6 +2662,76 @@ const renderApp = (): void => {
   bindEvents();
 };
 
+const pollChannelActivity = async (): Promise<void> => {
+  if (!state.user || !state.token) return;
+  try {
+    const res = await fetch("/api/activity/feed");
+    if (!res.ok) return;
+    const data = await res.json();
+    const activities = data.activities as
+      | Record<string, { lastMessageAt: number; lastSender: string; snippet: string }>
+      | undefined;
+    if (!activities) return;
+
+    let hasChange = false;
+    const nextUnread = { ...state.unreadChannels };
+    const nextMentions = { ...state.channelMentions };
+    const nextMentionsList = [...state.mentions];
+    const myTag = `@${state.user.username.toLowerCase()}`;
+
+    for (const [roomId, act] of Object.entries(activities)) {
+      if (roomId === state.activeChannelId) continue;
+
+      const lastRead = lastReadTimestamps[roomId] || 0;
+      if (act.lastMessageAt > lastRead) {
+        if (!nextUnread[roomId]) {
+          nextUnread[roomId] = 1;
+          hasChange = true;
+        }
+
+        if (
+          act.snippet &&
+          act.snippet.toLowerCase().includes(myTag) &&
+          act.lastSender !== state.user.username
+        ) {
+          if (!nextMentions[roomId]) {
+            nextMentions[roomId] = true;
+            hasChange = true;
+
+            const ch = state.channels.find((c) => c.id === roomId);
+            const chName = ch ? ch.name : roomId;
+            const exists = nextMentionsList.some(
+              (m) => m.roomId === roomId && m.createdAt === act.lastMessageAt
+            );
+            if (!exists) {
+              nextMentionsList.unshift({
+                id: `act_${roomId}_${act.lastMessageAt}`,
+                roomId,
+                roomName: chName,
+                senderName: act.lastSender,
+                content: act.snippet,
+                createdAt: act.lastMessageAt,
+              });
+              showSlackAlertToast(`@${act.lastSender} mentioned you in #${chName}`, act.snippet, roomId);
+            }
+          }
+        }
+      }
+    }
+
+    if (hasChange) {
+      updateState((s) => ({
+        ...s,
+        unreadChannels: nextUnread,
+        channelMentions: nextMentions,
+        mentions: nextMentionsList,
+      }));
+    }
+  } catch (err) {
+    console.debug("Activity feed poll skipped:", err);
+  }
+};
+
 // ==========================================================================
 // Initialization
 // ==========================================================================
@@ -2429,23 +2742,30 @@ const init = async (): Promise<void> => {
   // Resume WebSocket connection immediately if browser tab was idle, backgrounded, or wake-from-sleep
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
-      ensureWebSocketConnected();
+      checkAndHealWebSocket();
+      pollChannelActivity();
     }
   });
 
   window.addEventListener("focus", () => {
-    ensureWebSocketConnected();
+    checkAndHealWebSocket();
+    pollChannelActivity();
   });
 
   window.addEventListener("online", () => {
-    ensureWebSocketConnected();
+    checkAndHealWebSocket();
+    pollChannelActivity();
   });
 
   renderApp();
 
+  if (activityPollInterval) clearInterval(activityPollInterval);
+  activityPollInterval = window.setInterval(pollChannelActivity, 4000);
+
   if (state.user && state.token) {
     await fetchUserProfile(state.user.id);
     checkHashRoute();
+    pollChannelActivity();
   }
 };
 

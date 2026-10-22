@@ -44,7 +44,8 @@ export default {
         url.pathname.startsWith("/api/channels/create") ||
         url.pathname.startsWith("/api/channels/join-invite") ||
         url.pathname.startsWith("/api/channels/resolve-invite") ||
-        url.pathname === "/api/me"
+        url.pathname === "/api/me" ||
+        url.pathname.startsWith("/api/activity")
       ) {
         // Singleton UserDO instance
         const userDoId = env.USERS.idFromName("global_user_registry");

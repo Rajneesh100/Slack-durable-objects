@@ -22,6 +22,13 @@ CREATE TABLE IF NOT EXISTS channels (
   created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS channel_activity (
+  room_id TEXT PRIMARY KEY,
+  last_message_at INTEGER NOT NULL,
+  last_sender TEXT NOT NULL,
+  snippet TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 CREATE INDEX IF NOT EXISTS idx_channels_invite ON channels(invite_code);
 `;
