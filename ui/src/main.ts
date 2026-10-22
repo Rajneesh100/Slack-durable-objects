@@ -3,9 +3,11 @@
  * Authentic Slack Experience:
  * - Real-time chronological messaging via Durable Objects
  * - Clickable links & auto-joining in-app invite links
- * - Rich file & image sharing
- * - Slack emoji reactions and picker popover
- * - Functional immutable state container
+ * - Rich file & image sharing (Enter sends file + text reliably)
+ * - Slack emoji reactions & emoji drawer
+ * - 1-Click Guest Login (username: guest, password: guest123)
+ * - User tagging (@username) with Slack mention badges
+ * - Unread channel counters & Slack Alert notification banners
  */
 
 interface FileAttachment {
@@ -41,6 +43,12 @@ interface ChatMessage {
   readonly createdAt: number;
 }
 
+interface AlertToast {
+  readonly title: string;
+  readonly snippet: string;
+  readonly channelId: string;
+}
+
 interface AppState {
   readonly user: { readonly id: string; readonly username: string } | null;
   readonly token: string | null;
@@ -57,6 +65,9 @@ interface AppState {
   readonly copiedInvite: boolean;
   readonly showEmojiPicker: boolean;
   readonly pendingAttachment: FileAttachment | null;
+  readonly unreadChannels: Readonly<Record<string, number>>;
+  readonly alertToast: AlertToast | null;
+  readonly mentionQuery: string | null;
 }
 
 // Common Slack Emojis
@@ -69,10 +80,8 @@ const SLACK_EMOJIS = [
   "☕", "🍕", "🍔", "🍻", "💻", "📱", "🎯", "💎"
 ];
 
-// Quick reaction bar emojis
 const QUICK_REACTIONS = ["👍", "❤️", "🔥", "😂", "🚀", "👀"];
 
-// Deterministic vibrant avatar gradients based on username
 const AVATAR_GRADIENTS = [
   "linear-gradient(135deg, #e01e5a 0%, #f43f5e 100%)",
   "linear-gradient(135deg, #4a154b 0%, #611f69 100%)",
@@ -150,16 +159,28 @@ let state: AppState = {
   copiedInvite: false,
   showEmojiPicker: false,
   pendingAttachment: null,
+  unreadChannels: {},
+  alertToast: null,
+  mentionQuery: null,
 };
 
 let activeSocket: WebSocket | null = null;
 let typingDebounceTimer: number | null = null;
+let toastTimeout: number | null = null;
 let lastTypingSent = 0;
 
 // Update state and trigger re-render
 const updateState = (updater: (prev: AppState) => AppState): void => {
   state = updater(state);
   renderApp();
+};
+
+const showSlackAlertToast = (title: string, snippet: string, channelId: string): void => {
+  updateState((s) => ({ ...s, alertToast: { title, snippet, channelId } }));
+  if (toastTimeout) clearTimeout(toastTimeout);
+  toastTimeout = window.setTimeout(() => {
+    updateState((s) => ({ ...s, alertToast: null }));
+  }, 6000);
 };
 
 // ==========================================================================
@@ -201,11 +222,39 @@ const connectWebSocket = (channelId: string, token: string): void => {
         }
 
         case "NEW_MESSAGE": {
-          updateState((s) => ({
-            ...s,
-            messages: [...s.messages, data.message],
-          }));
-          scrollChatToBottom();
+          const msg: ChatMessage = data.message;
+          const isCurrentRoom = msg.roomId === state.activeChannelId;
+
+          // Check if message tags current user (@username)
+          if (state.user && msg.content && state.user.id !== msg.senderId) {
+            const myTag = `@${state.user.username.toLowerCase()}`;
+            if (msg.content.toLowerCase().includes(myTag)) {
+              const ch = state.channels.find((c) => c.id === msg.roomId);
+              showSlackAlertToast(
+                `@${msg.senderName} mentioned you in #${ch?.name || "channel"}`,
+                msg.content,
+                msg.roomId
+              );
+              document.title = `(🔔 1) Slack — #${ch?.name || "chat"}`;
+            }
+          }
+
+          if (isCurrentRoom) {
+            updateState((s) => ({
+              ...s,
+              messages: [...s.messages, msg],
+            }));
+            scrollChatToBottom();
+          } else {
+            // Unread indicator for other channels
+            updateState((s) => ({
+              ...s,
+              unreadChannels: {
+                ...s.unreadChannels,
+                [msg.roomId]: (s.unreadChannels[msg.roomId] || 0) + 1,
+              },
+            }));
+          }
           break;
         }
 
@@ -278,8 +327,26 @@ const sendChatMessage = (content: string): void => {
     })
   );
 
-  updateState((s) => ({ ...s, pendingAttachment: null, showEmojiPicker: false }));
+  updateState((s) => ({
+    ...s,
+    pendingAttachment: null,
+    showEmojiPicker: false,
+    mentionQuery: null,
+  }));
   sendTypingSignal(false);
+};
+
+const submitCurrentMessage = (): void => {
+  const chatInput = document.getElementById("chat-input") as HTMLTextAreaElement | null;
+  if (!chatInput) return;
+  const content = chatInput.value;
+
+  if (content.trim().length === 0 && !state.pendingAttachment) return;
+
+  sendChatMessage(content);
+  chatInput.value = "";
+  chatInput.style.height = "auto";
+  chatInput.focus();
 };
 
 const toggleMessageReaction = (messageId: string, emoji: string): void => {
@@ -323,13 +390,12 @@ const escapeHtml = (unsafe: string): string => {
     .replace(/'/g, "&#039;");
 };
 
-const formatMessageText = (rawContent: string): string => {
+const formatMessageText = (rawContent: string, currentUsername?: string): string => {
   let safe = escapeHtml(rawContent);
 
   // Auto-link URLs
   const urlRegex = /(https?:\/\/[^\s<]+)/g;
   safe = safe.replace(urlRegex, (url) => {
-    // Check if it's an invite link to this app
     const inviteMatch = url.match(/#invite=([a-zA-Z0-9_-]+)/);
     if (inviteMatch) {
       const code = inviteMatch[1];
@@ -338,12 +404,16 @@ const formatMessageText = (rawContent: string): string => {
     return `<a href="${url}" target="_blank" rel="noopener noreferrer" class="chat-link">${url}</a>`;
   });
 
+  // User mentions (@username)
+  const mentionRegex = /@([a-zA-Z0-9_-]+)/g;
+  safe = safe.replace(mentionRegex, (_match, username) => {
+    const isMe = currentUsername && username.toLowerCase() === currentUsername.toLowerCase();
+    return `<span class="mention-tag ${isMe ? "mention-me" : ""}">@${username}</span>`;
+  });
+
   // Basic Slack markdown
-  // Inline code: `code`
   safe = safe.replace(/`([^`]+)`/g, '<code style="background:rgba(255,255,255,0.1);padding:2px 4px;border-radius:3px;font-family:monospace;">$1</code>');
-  // Bold: *bold*
   safe = safe.replace(/\*([^*]+)\*/g, "<strong>$1</strong>");
-  // Italic: _italic_
   safe = safe.replace(/_([^_]+)_/g, "<em>$1</em>");
 
   return safe;
@@ -403,6 +473,49 @@ const handleAuthSubmit = async (e: Event): Promise<void> => {
     checkHashRoute();
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Network error";
+    updateState((s) => ({ ...s, authError: message }));
+  }
+};
+
+const handleGuestLogin = async (): Promise<void> => {
+  updateState((s) => ({ ...s, authError: null }));
+
+  try {
+    // 1. Try login with public guest account
+    let res = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "guest", password: "guest123" }),
+    });
+
+    // 2. If guest user does not exist yet in database, automatically create it!
+    if (!res.ok) {
+      res = await fetch("/api/auth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "guest", password: "guest123" }),
+      });
+    }
+
+    const data = await res.json();
+    if (!res.ok) {
+      updateState((s) => ({ ...s, authError: data.error || "Guest login failed" }));
+      return;
+    }
+
+    savePersistedAuth(data.token, { id: data.user.id, username: data.user.username });
+
+    updateState((s) => ({
+      ...s,
+      token: data.token,
+      user: { id: data.user.id, username: data.user.username },
+      channels: data.user.joinedChannels || s.channels,
+      authError: null,
+    }));
+
+    checkHashRoute();
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Guest login failed";
     updateState((s) => ({ ...s, authError: message }));
   }
 };
@@ -546,8 +659,19 @@ const handleCopyInviteLink = async (): Promise<void> => {
 const switchChannel = (channelId: string): void => {
   if (state.activeChannelId === channelId) return;
 
+  // Clear unread badge for this channel
+  const nextUnread = { ...state.unreadChannels };
+  delete nextUnread[channelId];
+
+  document.title = "Slack — Durable Objects";
   window.location.hash = `channel=${channelId}`;
-  updateState((s) => ({ ...s, activeChannelId: channelId, showEmojiPicker: false }));
+  updateState((s) => ({
+    ...s,
+    activeChannelId: channelId,
+    showEmojiPicker: false,
+    mentionQuery: null,
+    unreadChannels: nextUnread,
+  }));
 
   if (state.token) connectWebSocket(channelId, state.token);
 };
@@ -594,6 +718,10 @@ const handleFileUpload = (file: File): void => {
       dataUrl,
     };
     updateState((s) => ({ ...s, pendingAttachment: attachment }));
+
+    // Refocus the textarea after file selection
+    const chatInput = document.getElementById("chat-input") as HTMLTextAreaElement | null;
+    if (chatInput) chatInput.focus();
   };
   reader.readAsDataURL(file);
 };
@@ -657,6 +785,12 @@ const renderAuthScreen = (): string => `
         <button type="submit" class="auth-submit-btn">
           <span>${state.authMode === "login" ? "Sign In" : "Register"}</span>
         </button>
+
+        <div class="auth-divider"><span>OR</span></div>
+
+        <button type="button" id="guest-login-btn" class="auth-guest-btn">
+          <span>⚡ Explore as Guest (1-Click)</span>
+        </button>
       </form>
     </div>
   </main>
@@ -693,8 +827,14 @@ const renderMessage = (msg: ChatMessage): string => {
   const initials = getInitials(msg.senderName);
   const reactions = msg.reactions || {};
 
+  const isMentioned = Boolean(
+    state.user &&
+      msg.content &&
+      msg.content.toLowerCase().includes(`@${state.user.username.toLowerCase()}`)
+  );
+
   return `
-    <div class="message-item" id="msg-${msg.id}" data-message-id="${msg.id}">
+    <div class="message-item ${isMentioned ? "is-mentioned" : ""}" id="msg-${msg.id}" data-message-id="${msg.id}">
       <!-- Slack Floating Action Bar on Hover -->
       <div class="message-action-bar">
         ${QUICK_REACTIONS.map(
@@ -714,7 +854,7 @@ const renderMessage = (msg: ChatMessage): string => {
           <span class="message-sender">${escapeHtml(msg.senderName)}</span>
           <span class="message-timestamp">${formatTime(msg.createdAt)}</span>
         </div>
-        ${msg.content ? `<div class="message-content">${formatMessageText(msg.content)}</div>` : ""}
+        ${msg.content ? `<div class="message-content">${formatMessageText(msg.content, state.user?.username)}</div>` : ""}
         ${msg.attachment ? renderAttachment(msg.attachment) : ""}
 
         <!-- Reaction Pills -->
@@ -761,6 +901,15 @@ const renderSlackApp = (): string => {
   const userInitials = state.user ? getInitials(state.user.username) : "U";
   const otherTypingUsers = state.typingUsers.filter((u) => u !== state.user?.username);
 
+  // Mention autocomplete candidates
+  const mentionCandidates = state.mentionQuery !== null
+    ? state.participants.filter(
+        (p) =>
+          p.username.toLowerCase().startsWith(state.mentionQuery!.toLowerCase()) &&
+          p.username !== state.user?.username
+      )
+    : [];
+
   return `
     <div class="slack-container">
       <!-- Left Sidebar -->
@@ -786,18 +935,21 @@ const renderSlackApp = (): string => {
 
             <nav class="channel-list" aria-label="Channels">
               ${state.channels
-                .map(
-                  (ch) => `
-                <a
-                  href="#channel=${ch.id}"
-                  class="channel-item ${ch.id === state.activeChannelId ? "active" : ""}"
-                  data-channel-id="${ch.id}"
-                >
-                  <span class="channel-hash">#</span>
-                  <span class="channel-name">${escapeHtml(ch.name)}</span>
-                </a>
-              `
-                )
+                .map((ch) => {
+                  const unread = state.unreadChannels[ch.id] || 0;
+                  const isActive = ch.id === state.activeChannelId;
+                  return `
+                    <a
+                      href="#channel=${ch.id}"
+                      class="channel-item ${isActive ? "active" : ""} ${unread > 0 ? "has-unread" : ""}"
+                      data-channel-id="${ch.id}"
+                    >
+                      <span class="channel-hash">#</span>
+                      <span class="channel-name">${escapeHtml(ch.name)}</span>
+                      ${unread > 0 ? `<span class="channel-unread-badge">${unread}</span>` : ""}
+                    </a>
+                  `;
+                })
                 .join("")}
             </nav>
           </div>
@@ -827,6 +979,21 @@ const renderSlackApp = (): string => {
 
       <!-- Main Chat Area -->
       <section class="chat-pane" id="chat-pane-container">
+        <!-- Floating Alert Banner -->
+        ${
+          state.alertToast
+            ? `
+            <div class="slack-alert-toast" id="slack-alert-banner" data-channel-id="${state.alertToast.channelId}">
+              <div class="slack-alert-icon">🔔</div>
+              <div class="slack-alert-content">
+                <span class="slack-alert-title">${escapeHtml(state.alertToast.title)}</span>
+                <span class="slack-alert-snippet">${escapeHtml(state.alertToast.snippet)}</span>
+              </div>
+            </div>
+          `
+            : ""
+        }
+
         <!-- Channel Top Bar -->
         <header class="chat-header">
           <div class="channel-meta">
@@ -873,8 +1040,28 @@ const renderSlackApp = (): string => {
           }
         </div>
 
-        <!-- Composer Box (Slack Rich Bar) -->
+        <!-- Composer Box -->
         <div class="chat-composer-container">
+          <!-- Mention Autocomplete Menu -->
+          ${
+            mentionCandidates.length > 0
+              ? `
+              <div class="mention-autocomplete-menu" id="mention-menu">
+                ${mentionCandidates
+                  .map(
+                    (p) => `
+                  <button type="button" class="mention-option-btn" data-mention-username="${escapeHtml(p.username)}">
+                    <span>@</span>
+                    <span>${escapeHtml(p.username)}</span>
+                  </button>
+                `
+                  )
+                  .join("")}
+              </div>
+            `
+              : ""
+          }
+
           <form id="chat-form" class="composer-box">
             <!-- Pending Attachment Preview -->
             ${
@@ -887,7 +1074,7 @@ const renderSlackApp = (): string => {
                       : `<span>📄</span>`
                   }
                   <span class="composer-attachment-name">${escapeHtml(state.pendingAttachment.name)} (${formatFileSize(state.pendingAttachment.size)})</span>
-                  <button type="button" id="remove-attachment-btn" class="composer-attachment-remove">&times;</button>
+                  <button type="button" id="remove-attachment-btn" class="composer-attachment-remove" title="Remove">&times;</button>
                 </div>
               `
                 : ""
@@ -896,7 +1083,7 @@ const renderSlackApp = (): string => {
             <textarea
               id="chat-input"
               class="composer-textarea"
-              placeholder="Message #${escapeHtml(currentChannel.name)}"
+              placeholder="Message #${escapeHtml(currentChannel.name)} (Type @ to mention)"
               rows="1"
             ></textarea>
 
@@ -915,7 +1102,7 @@ const renderSlackApp = (): string => {
               </div>
 
               <div class="toolbar-group">
-                <button type="submit" id="send-msg-btn" class="send-btn" title="Send message">
+                <button type="submit" id="send-msg-btn" class="send-btn" title="Send message (Enter)">
                   <svg style="width:14px;height:14px;fill:currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
                 </button>
               </div>
@@ -1039,10 +1226,12 @@ const bindEvents = (): void => {
   const tabLogin = document.getElementById("tab-login");
   const tabRegister = document.getElementById("tab-register");
   const authForm = document.getElementById("auth-form");
+  const guestBtn = document.getElementById("guest-login-btn");
 
   if (tabLogin) tabLogin.onclick = () => updateState((s) => ({ ...s, authMode: "login", authError: null }));
   if (tabRegister) tabRegister.onclick = () => updateState((s) => ({ ...s, authMode: "register", authError: null }));
   if (authForm) authForm.onsubmit = handleAuthSubmit;
+  if (guestBtn) guestBtn.onclick = handleGuestLogin;
 
   // App Events
   const logoutBtn = document.getElementById("logout-btn");
@@ -1082,6 +1271,16 @@ const bindEvents = (): void => {
       if (code) joinInviteCodeDirectly(code);
     };
   });
+
+  // Alert Banner Click to switch channel
+  const alertBanner = document.getElementById("slack-alert-banner");
+  if (alertBanner) {
+    alertBanner.onclick = () => {
+      const chId = alertBanner.getAttribute("data-channel-id");
+      if (chId) switchChannel(chId);
+      updateState((s) => ({ ...s, alertToast: null }));
+    };
+  }
 
   // Modal Openers
   const openCreateBtn = document.getElementById("open-create-channel");
@@ -1160,6 +1359,26 @@ const bindEvents = (): void => {
     };
   });
 
+  // Mention Options Click
+  const mentionOptionBtns = document.querySelectorAll<HTMLElement>(".mention-option-btn");
+  mentionOptionBtns.forEach((btn) => {
+    btn.onclick = () => {
+      const username = btn.getAttribute("data-mention-username");
+      const chatInput = document.getElementById("chat-input") as HTMLTextAreaElement | null;
+      if (username && chatInput) {
+        const val = chatInput.value;
+        const atIndex = val.lastIndexOf("@");
+        if (atIndex !== -1) {
+          chatInput.value = val.substring(0, atIndex) + `@${username} `;
+        } else {
+          chatInput.value += `@${username} `;
+        }
+        updateState((s) => ({ ...s, mentionQuery: null }));
+        chatInput.focus();
+      }
+    };
+  });
+
   // Close emoji popover when clicking outside
   document.onclick = (e) => {
     const popover = document.getElementById("emoji-popover");
@@ -1191,9 +1410,7 @@ const bindEvents = (): void => {
   // Drag and drop file onto chat container
   const chatPane = document.getElementById("chat-pane-container");
   if (chatPane) {
-    chatPane.ondragover = (e) => {
-      e.preventDefault();
-    };
+    chatPane.ondragover = (e) => e.preventDefault();
     chatPane.ondrop = (e) => {
       e.preventDefault();
       const file = e.dataTransfer?.files[0];
@@ -1201,28 +1418,36 @@ const bindEvents = (): void => {
     };
   }
 
-  // Chat Composer Input
+  // Chat Composer Input & Keyboard Shortcuts
   const chatForm = document.getElementById("chat-form");
   const chatInput = document.getElementById("chat-input") as HTMLTextAreaElement | null;
 
   if (chatForm && chatInput) {
     chatForm.onsubmit = (e) => {
       e.preventDefault();
-      sendChatMessage(chatInput.value);
-      chatInput.value = "";
-      chatInput.style.height = "auto";
+      submitCurrentMessage();
     };
 
     chatInput.onkeydown = (e) => {
+      // ENTER sends the message + attachment! (Shift + Enter for new lines)
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
-        chatForm.dispatchEvent(new Event("submit"));
+        submitCurrentMessage();
       }
     };
 
     chatInput.oninput = () => {
       chatInput.style.height = "auto";
       chatInput.style.height = Math.min(chatInput.scrollHeight, 140) + "px";
+
+      // Detect @ mention typing
+      const val = chatInput.value;
+      const atMatch = val.match(/@([a-zA-Z0-9_-]*)$/);
+      if (atMatch) {
+        updateState((s) => ({ ...s, mentionQuery: atMatch[1] || "" }));
+      } else if (state.mentionQuery !== null) {
+        updateState((s) => ({ ...s, mentionQuery: null }));
+      }
 
       sendTypingSignal(true);
       if (typingDebounceTimer) clearTimeout(typingDebounceTimer);
