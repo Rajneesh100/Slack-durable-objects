@@ -341,6 +341,40 @@ const clearPersistedAuth = (): void => {
   localStorage.removeItem("dc_user");
 };
 
+const loadPersistedMentions = (
+  userId: string | null
+): { mentions: MentionItem[]; unreadCount: number } => {
+  if (!userId) return { mentions: [], unreadCount: 0 };
+  try {
+    const rawMentions = localStorage.getItem(`slack_mentions_${userId}`);
+    const mentions: MentionItem[] = rawMentions ? JSON.parse(rawMentions) : [];
+    const rawUnread = localStorage.getItem(`slack_unread_mentions_${userId}`);
+    const unreadCount = rawUnread ? Math.max(0, parseInt(rawUnread, 10) || 0) : 0;
+    return { mentions, unreadCount };
+  } catch {
+    return { mentions: [], unreadCount: 0 };
+  }
+};
+
+const savePersistedMentions = (
+  userId: string | null,
+  mentions: readonly MentionItem[],
+  unreadCount: number
+): void => {
+  if (!userId) return;
+  try {
+    localStorage.setItem(`slack_mentions_${userId}`, JSON.stringify(mentions.slice(0, 100)));
+    localStorage.setItem(`slack_unread_mentions_${userId}`, unreadCount.toString());
+  } catch {}
+};
+
+const isMentioningUser = (content: string, username: string): boolean => {
+  if (!content || !username) return false;
+  const escaped = username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const regex = new RegExp(`(?:^|[^a-zA-Z0-9_])@${escaped}(?![a-zA-Z0-9_-])`, "i");
+  return regex.test(content);
+};
+
 const formatRelativeTime = (timestamp: number): string => {
   const diff = Date.now() - timestamp;
   const minutes = Math.floor(diff / 60000);
@@ -356,6 +390,7 @@ const formatRelativeTime = (timestamp: number): string => {
 
 // Initial State
 const initialAuth = loadPersistedAuth();
+const initialMentions = loadPersistedMentions(initialAuth.user?.id || null);
 
 let state: AppState = {
   user: initialAuth.user,
@@ -382,8 +417,8 @@ let state: AppState = {
   threadPendingAttachment: null,
   unreadChannels: {},
   channelMentions: {},
-  mentions: [],
-  unreadMentionsCount: 0,
+  mentions: initialMentions.mentions,
+  unreadMentionsCount: initialMentions.unreadCount,
   isViewingMentions: false,
   alertToast: null,
   mentionQuery: null,
@@ -645,11 +680,49 @@ const connectWebSocket = (channelId: string, token: string): void => {
 
         case "ROOM_SNAPSHOT": {
           lastReadTimestamps[channelId] = Date.now();
-          updateState((s) => ({
-            ...s,
-            messages: data.messages || [],
-            participants: data.participants || [],
-          }));
+          const snapshotMsgs: ChatMessage[] = data.messages || [];
+
+          // Scan snapshot messages for any mentions of current user
+          const snapshotMentions: MentionItem[] = [];
+          if (state.user) {
+            const ch = state.channels.find((c) => c.id === channelId);
+            const chName = ch ? ch.name : channelId;
+            for (const m of snapshotMsgs) {
+              if (
+                m.content &&
+                m.senderId !== state.user.id &&
+                isMentioningUser(m.content, state.user.username)
+              ) {
+                snapshotMentions.push({
+                  id: m.id,
+                  roomId: m.roomId || channelId,
+                  roomName: chName,
+                  senderName: m.senderName,
+                  content: m.content,
+                  createdAt: m.createdAt,
+                });
+              }
+            }
+          }
+
+          updateState((s) => {
+            const existingIds = new Set(s.mentions.map((m) => m.id));
+            const newMentions = snapshotMentions.filter((m) => !existingIds.has(m.id));
+            const mergedMentions = [...newMentions, ...s.mentions].sort(
+              (a, b) => b.createdAt - a.createdAt
+            );
+
+            if (newMentions.length > 0 && s.user) {
+              savePersistedMentions(s.user.id, mergedMentions, s.unreadMentionsCount);
+            }
+
+            return {
+              ...s,
+              messages: snapshotMsgs,
+              participants: data.participants || [],
+              mentions: mergedMentions,
+            };
+          });
           scrollChatToBottom();
           break;
         }
@@ -659,51 +732,55 @@ const connectWebSocket = (channelId: string, token: string): void => {
           const isCurrentRoom = msg.roomId === state.activeChannelId;
 
           // Check if message tags current user (@username)
+          let isMentionForMe = false;
+          let newMentionItem: MentionItem | null = null;
           if (state.user && msg.content && state.user.id !== msg.senderId) {
-            const myTag = `@${state.user.username.toLowerCase()}`;
-            if (msg.content.toLowerCase().includes(myTag)) {
+            if (isMentioningUser(msg.content, state.user.username)) {
+              isMentionForMe = true;
               const ch = state.channels.find((c) => c.id === msg.roomId);
               const roomName = ch?.name || msg.roomId;
+              newMentionItem = {
+                id: msg.id,
+                roomId: msg.roomId,
+                roomName,
+                senderName: msg.senderName,
+                content: msg.content,
+                createdAt: msg.createdAt,
+              };
               showSlackAlertToast(
                 `@${msg.senderName} mentioned you in #${roomName}`,
                 msg.content,
                 msg.roomId
               );
               document.title = `(🔔 1) Slack — #${roomName}`;
-
-              // Add to mentions and channel mention badge
-              updateState((s) => {
-                const exists = s.mentions.some((m) => m.id === msg.id);
-                const nextMentions = exists
-                  ? s.mentions
-                  : [
-                      {
-                        id: msg.id,
-                        roomId: msg.roomId,
-                        roomName,
-                        senderName: msg.senderName,
-                        content: msg.content,
-                        createdAt: msg.createdAt,
-                      },
-                      ...s.mentions,
-                    ];
-                return {
-                  ...s,
-                  unreadMentionsCount: s.isViewingMentions ? 0 : s.unreadMentionsCount + 1,
-                  channelMentions: {
-                    ...s.channelMentions,
-                    [msg.roomId]: true,
-                  },
-                  mentions: nextMentions,
-                };
-              });
             }
           }
 
-          if (isCurrentRoom) {
-            if (msg.parentId) {
-              // Thread reply: update active thread and increment parent's replyCount
-              updateState((s) => {
+          updateState((s) => {
+            let nextMentions = s.mentions;
+            let nextUnreadMentions = s.unreadMentionsCount;
+            let nextChannelMentions = s.channelMentions;
+
+            if (isMentionForMe && newMentionItem) {
+              const exists = s.mentions.some((m) => m.id === msg.id);
+              if (!exists) {
+                nextMentions = [newMentionItem, ...s.mentions];
+              }
+              // If user is currently viewing the Mentions pane, keep unread count 0.
+              // Otherwise increment so the red count highlight appears in the sidebar like Slack!
+              nextUnreadMentions = s.isViewingMentions ? 0 : s.unreadMentionsCount + 1;
+              nextChannelMentions = {
+                ...s.channelMentions,
+                [msg.roomId]: true,
+              };
+              if (s.user) {
+                savePersistedMentions(s.user.id, nextMentions, nextUnreadMentions);
+              }
+            }
+
+            if (isCurrentRoom) {
+              if (msg.parentId) {
+                // Thread reply: update active thread and increment parent's replyCount
                 const isMatchingActiveThread = s.activeThreadParentId === msg.parentId;
                 const nextThreadMessages = isMatchingActiveThread
                   ? [...s.threadMessages, msg]
@@ -722,31 +799,43 @@ const connectWebSocket = (channelId: string, token: string): void => {
 
                 return {
                   ...s,
+                  mentions: nextMentions,
+                  unreadMentionsCount: nextUnreadMentions,
+                  channelMentions: nextChannelMentions,
                   messages: nextMessages,
                   threadMessages: nextThreadMessages,
                 };
-              });
-
-              if (state.activeThreadParentId === msg.parentId) {
-                scrollThreadToBottom();
+              } else {
+                // Top-level channel message
+                return {
+                  ...s,
+                  mentions: nextMentions,
+                  unreadMentionsCount: nextUnreadMentions,
+                  channelMentions: nextChannelMentions,
+                  messages: [...s.messages, msg],
+                };
               }
             } else {
-              // Top-level channel message
-              updateState((s) => ({
+              // Unread indicator for other channels
+              return {
                 ...s,
-                messages: [...s.messages, msg],
-              }));
+                mentions: nextMentions,
+                unreadMentionsCount: nextUnreadMentions,
+                channelMentions: nextChannelMentions,
+                unreadChannels: {
+                  ...s.unreadChannels,
+                  [msg.roomId]: (s.unreadChannels[msg.roomId] || 0) + 1,
+                },
+              };
+            }
+          });
+
+          if (isCurrentRoom) {
+            if (msg.parentId && state.activeThreadParentId === msg.parentId) {
+              scrollThreadToBottom();
+            } else if (!msg.parentId) {
               scrollChatToBottom();
             }
-          } else {
-            // Unread indicator for other channels
-            updateState((s) => ({
-              ...s,
-              unreadChannels: {
-                ...s.unreadChannels,
-                [msg.roomId]: (s.unreadChannels[msg.roomId] || 0) + 1,
-              },
-            }));
           }
           break;
         }
@@ -1120,12 +1209,15 @@ const handleAuthSubmit = async (e: Event): Promise<void> => {
     }
 
     savePersistedAuth(data.token, { id: data.user.id, username: data.user.username });
+    const userMentions = loadPersistedMentions(data.user.id);
 
     updateState((s) => ({
       ...s,
       token: data.token,
       user: { id: data.user.id, username: data.user.username },
       channels: data.user.joinedChannels || s.channels,
+      mentions: userMentions.mentions,
+      unreadMentionsCount: userMentions.unreadCount,
       authError: null,
     }));
 
@@ -1163,12 +1255,15 @@ const handleGuestLogin = async (): Promise<void> => {
     }
 
     savePersistedAuth(data.token, { id: data.user.id, username: data.user.username });
+    const guestMentions = loadPersistedMentions(data.user.id);
 
     updateState((s) => ({
       ...s,
       token: data.token,
       user: { id: data.user.id, username: data.user.username },
       channels: data.user.joinedChannels || s.channels,
+      mentions: guestMentions.mentions,
+      unreadMentionsCount: guestMentions.unreadCount,
       authError: null,
     }));
 
@@ -2297,15 +2392,20 @@ const bindEvents = (): void => {
   const openMentionsBtn = document.getElementById("open-mentions-btn");
   if (openMentionsBtn) {
     openMentionsBtn.onclick = () => {
-      updateState((s) => ({
-        ...s,
-        isViewingMentions: !s.isViewingMentions,
-        unreadMentionsCount: 0, // Highlight turns off when seen like Slack!
-        activeThreadParentId: null,
-        threadMessages: [],
-        showEmojiPicker: false,
-        showThreadEmojiPicker: false,
-      }));
+      updateState((s) => {
+        if (s.user) {
+          savePersistedMentions(s.user.id, s.mentions, 0);
+        }
+        return {
+          ...s,
+          isViewingMentions: !s.isViewingMentions,
+          unreadMentionsCount: 0, // Highlight turns off when seen like Slack!
+          activeThreadParentId: null,
+          threadMessages: [],
+          showEmojiPicker: false,
+          showThreadEmojiPicker: false,
+        };
+      });
     };
   }
 
@@ -2710,7 +2810,6 @@ const pollChannelActivity = async (): Promise<void> => {
     const nextUnread = { ...state.unreadChannels };
     const nextMentions = { ...state.channelMentions };
     const nextMentionsList = [...state.mentions];
-    const myTag = `@${state.user.username.toLowerCase()}`;
 
     for (const [roomId, act] of Object.entries(activities)) {
       if (roomId === state.activeChannelId) continue;
@@ -2724,7 +2823,7 @@ const pollChannelActivity = async (): Promise<void> => {
 
         if (
           act.snippet &&
-          act.snippet.toLowerCase().includes(myTag) &&
+          isMentioningUser(act.snippet, state.user.username) &&
           act.lastSender !== state.user.username
         ) {
           if (!nextMentions[roomId]) {
@@ -2753,13 +2852,20 @@ const pollChannelActivity = async (): Promise<void> => {
     }
 
     if (hasChange) {
-      updateState((s) => ({
-        ...s,
-        unreadChannels: nextUnread,
-        channelMentions: nextMentions,
-        mentions: nextMentionsList,
-        unreadMentionsCount: s.isViewingMentions ? 0 : s.unreadMentionsCount + Math.max(0, nextMentionsList.length - s.mentions.length),
-      }));
+      updateState((s) => {
+        const addedCount = Math.max(0, nextMentionsList.length - s.mentions.length);
+        const nextUnreadCount = s.isViewingMentions ? 0 : s.unreadMentionsCount + addedCount;
+        if (s.user) {
+          savePersistedMentions(s.user.id, nextMentionsList, nextUnreadCount);
+        }
+        return {
+          ...s,
+          unreadChannels: nextUnread,
+          channelMentions: nextMentions,
+          mentions: nextMentionsList,
+          unreadMentionsCount: nextUnreadCount,
+        };
+      });
     }
   } catch (err) {
     console.debug("Activity feed poll skipped:", err);
