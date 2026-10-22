@@ -84,6 +84,7 @@ interface AppState {
   readonly unreadChannels: Readonly<Record<string, number>>;
   readonly channelMentions: Readonly<Record<string, boolean>>;
   readonly mentions: readonly MentionItem[];
+  readonly unreadMentionsCount: number;
   readonly isViewingMentions: boolean;
   readonly alertToast: AlertToast | null;
   readonly mentionQuery: string | null;
@@ -382,6 +383,7 @@ let state: AppState = {
   unreadChannels: {},
   channelMentions: {},
   mentions: [],
+  unreadMentionsCount: 0,
   isViewingMentions: false,
   alertToast: null,
   mentionQuery: null,
@@ -687,6 +689,7 @@ const connectWebSocket = (channelId: string, token: string): void => {
                     ];
                 return {
                   ...s,
+                  unreadMentionsCount: s.isViewingMentions ? 0 : s.unreadMentionsCount + 1,
                   channelMentions: {
                     ...s.channelMentions,
                     [msg.roomId]: true,
@@ -1814,6 +1817,7 @@ const renderMentionsPane = (): string => `
     }
     <header class="mentions-header">
       <h2><span>🔔</span> Mentions & Reactions</h2>
+      <button type="button" id="close-mentions-btn" class="thread-close-btn" title="Close and return to chat">&times;</button>
     </header>
     <div class="mentions-list">
       ${
@@ -1903,8 +1907,8 @@ const renderSlackApp = (): string => {
               <span class="activity-icon">🔔</span>
               <span class="activity-label">Mentions & Reactions</span>
               ${
-                state.mentions.length > 0
-                  ? `<span class="activity-badge">${state.mentions.length}</span>`
+                state.unreadMentionsCount > 0
+                  ? `<span class="activity-badge">${state.unreadMentionsCount}</span>`
                   : ""
               }
             </button>
@@ -2295,11 +2299,23 @@ const bindEvents = (): void => {
     openMentionsBtn.onclick = () => {
       updateState((s) => ({
         ...s,
-        isViewingMentions: true,
+        isViewingMentions: !s.isViewingMentions,
+        unreadMentionsCount: 0, // Highlight turns off when seen like Slack!
         activeThreadParentId: null,
         threadMessages: [],
         showEmojiPicker: false,
         showThreadEmojiPicker: false,
+      }));
+    };
+  }
+
+  // Close Mentions View Button
+  const closeMentionsBtn = document.getElementById("close-mentions-btn");
+  if (closeMentionsBtn) {
+    closeMentionsBtn.onclick = () => {
+      updateState((s) => ({
+        ...s,
+        isViewingMentions: false,
       }));
     };
   }
@@ -2742,6 +2758,7 @@ const pollChannelActivity = async (): Promise<void> => {
         unreadChannels: nextUnread,
         channelMentions: nextMentions,
         mentions: nextMentionsList,
+        unreadMentionsCount: s.isViewingMentions ? 0 : s.unreadMentionsCount + Math.max(0, nextMentionsList.length - s.mentions.length),
       }));
     }
   } catch (err) {
