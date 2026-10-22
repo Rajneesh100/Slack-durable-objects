@@ -68,6 +68,7 @@ interface AppState {
   readonly unreadChannels: Readonly<Record<string, number>>;
   readonly alertToast: AlertToast | null;
   readonly mentionQuery: string | null;
+  readonly isChannelForbidden: boolean;
 }
 
 // Common Slack Emojis
@@ -162,6 +163,7 @@ let state: AppState = {
   unreadChannels: {},
   alertToast: null,
   mentionQuery: null,
+  isChannelForbidden: false,
 };
 
 let activeSocket: WebSocket | null = null;
@@ -194,7 +196,31 @@ const connectWebSocket = (channelId: string, token: string): void => {
     activeSocket = null;
   }
 
-  updateState((s) => ({ ...s, isConnecting: true, messages: [], participants: [], typingUsers: [] }));
+  // Security Check: Is user authorized for this private channel?
+  const isPublic = channelId === "general" || channelId === "random";
+  const isMember = isPublic || state.channels.some((c) => c.id === channelId);
+
+  if (!isMember && state.channels.length > 0) {
+    // Channel is private and user is not an approved member!
+    updateState((s) => ({
+      ...s,
+      isChannelForbidden: true,
+      isConnecting: false,
+      messages: [],
+      participants: [],
+      typingUsers: [],
+    }));
+    return;
+  }
+
+  updateState((s) => ({
+    ...s,
+    isChannelForbidden: false,
+    isConnecting: true,
+    messages: [],
+    participants: [],
+    typingUsers: [],
+  }));
 
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const wsUrl = `${protocol}//${window.location.host}/api/channels/${channelId}/ws?token=${encodeURIComponent(token)}`;
@@ -203,7 +229,7 @@ const connectWebSocket = (channelId: string, token: string): void => {
   activeSocket = ws;
 
   ws.onopen = () => {
-    updateState((s) => ({ ...s, isConnecting: false }));
+    updateState((s) => ({ ...s, isConnecting: false, isChannelForbidden: false }));
   };
 
   ws.onmessage = (event) => {
@@ -298,19 +324,34 @@ const connectWebSocket = (channelId: string, token: string): void => {
           }));
           break;
         }
+
+        case "ERROR": {
+          if (data.error === "FORBIDDEN" || data.message?.includes("Access Denied")) {
+            updateState((s) => ({ ...s, isChannelForbidden: true, isConnecting: false }));
+          }
+          break;
+        }
       }
     } catch (e) {
       console.error("WS Parse error", e);
     }
   };
 
-  ws.onclose = () => {
-    updateState((s) => ({ ...s, isConnecting: false }));
+  ws.onclose = (event) => {
+    if (event.code === 4403 || event.code === 1008 || (!isPublic && !state.channels.some((c) => c.id === channelId))) {
+      updateState((s) => ({ ...s, isConnecting: false, isChannelForbidden: true }));
+    } else {
+      updateState((s) => ({ ...s, isConnecting: false }));
+    }
   };
 
   ws.onerror = (e) => {
     console.error("WebSocket error:", e);
-    updateState((s) => ({ ...s, isConnecting: false }));
+    if (!isPublic && !state.channels.some((c) => c.id === channelId)) {
+      updateState((s) => ({ ...s, isConnecting: false, isChannelForbidden: true }));
+    } else {
+      updateState((s) => ({ ...s, isConnecting: false }));
+    }
   };
 };
 
@@ -429,7 +470,14 @@ const fetchUserProfile = async (userId: string): Promise<void> => {
     if (res.ok) {
       const data = await res.json();
       if (data.user?.joinedChannels) {
-        updateState((s) => ({ ...s, channels: data.user.joinedChannels }));
+        const isPublic = state.activeChannelId === "general" || state.activeChannelId === "random";
+        const isMember = isPublic || (data.user.joinedChannels as ChannelInfo[]).some((c) => c.id === state.activeChannelId);
+
+        updateState((s) => ({
+          ...s,
+          channels: data.user.joinedChannels,
+          isChannelForbidden: !isMember && data.user.joinedChannels.length > 0,
+        }));
       }
     }
   } catch (err) {
@@ -621,8 +669,8 @@ const joinInviteCodeDirectly = async (inviteCode: string): Promise<void> => {
       body: JSON.stringify({ userId: state.user.id, inviteCode }),
     });
 
+    const data = await res.json();
     if (res.ok) {
-      const data = await res.json();
       const channel: ChannelInfo = data.channel;
       const exists = state.channels.some((c) => c.id === channel.id);
 
@@ -630,13 +678,17 @@ const joinInviteCodeDirectly = async (inviteCode: string): Promise<void> => {
         ...s,
         channels: exists ? s.channels : [...s.channels, channel],
         activeChannelId: channel.id,
+        isChannelForbidden: false,
       }));
 
       window.location.hash = `channel=${channel.id}`;
       connectWebSocket(channel.id, state.token);
+    } else {
+      alert(data.error || "Invalid or expired invite code.");
     }
   } catch (err) {
     console.error("Direct invite join error:", err);
+    alert("Could not join channel. Please check your network.");
   }
 };
 
@@ -657,7 +709,7 @@ const handleCopyInviteLink = async (): Promise<void> => {
 };
 
 const switchChannel = (channelId: string): void => {
-  if (state.activeChannelId === channelId) return;
+  if (state.activeChannelId === channelId && !state.isChannelForbidden) return;
 
   // Clear unread badge for this channel
   const nextUnread = { ...state.unreadChannels };
@@ -665,9 +717,14 @@ const switchChannel = (channelId: string): void => {
 
   document.title = "Slack — Durable Objects";
   window.location.hash = `channel=${channelId}`;
+
+  const isPublic = channelId === "general" || channelId === "random";
+  const isMember = isPublic || state.channels.some((c) => c.id === channelId);
+
   updateState((s) => ({
     ...s,
     activeChannelId: channelId,
+    isChannelForbidden: !isMember && state.channels.length > 0,
     showEmojiPicker: false,
     mentionQuery: null,
     unreadChannels: nextUnread,
@@ -688,7 +745,14 @@ const checkHashRoute = (): void => {
 
   const channelId = params.get("channel");
   if (channelId) {
-    updateState((s) => ({ ...s, activeChannelId: channelId }));
+    const isPublic = channelId === "general" || channelId === "random";
+    const isMember = isPublic || state.channels.some((c) => c.id === channelId);
+
+    updateState((s) => ({
+      ...s,
+      activeChannelId: channelId,
+      isChannelForbidden: !isMember && state.channels.length > 0,
+    }));
     if (state.token) connectWebSocket(channelId, state.token);
     return;
   }
@@ -995,138 +1059,181 @@ const renderSlackApp = (): string => {
         }
 
         <!-- Channel Top Bar -->
-        <header class="chat-header">
-          <div class="channel-meta">
-            <div class="channel-header-title">
-              <h2># ${escapeHtml(currentChannel.name)}</h2>
-            </div>
-            <span class="online-badge">
-              <span class="pulse-dot"></span>
-              ${state.participants.length} member${state.participants.length === 1 ? "" : "s"}
-            </span>
-          </div>
-
-          <div class="chat-header-actions">
-            <button
-              type="button"
-              id="share-invite-btn"
-              class="share-invite-btn ${state.copiedInvite ? "copied" : ""}"
-            >
-              <span>${state.copiedInvite ? "✓ Copied!" : "Copy Invite Link"}</span>
-            </button>
-          </div>
-        </header>
-
-        <!-- Messages Stream -->
-        <div id="messages-stream" class="messages-container">
-          ${
-            state.messages.length === 0
-              ? `
-              <div style="margin: auto; text-align: center; color: var(--text-muted); padding: 40px 20px;">
-                <h3 style="color: #fff; margin-bottom: 6px;">Welcome to #${escapeHtml(currentChannel.name)}!</h3>
-                <p>This room runs in an isolated Cloudflare Durable Object with SQLite. Share messages, upload files, or react with emojis!</p>
+        ${
+          state.isChannelForbidden
+            ? `
+            <header class="chat-header">
+              <div class="channel-meta">
+                <div class="channel-header-title">
+                  <h2>🔒 #${escapeHtml(currentChannel.name || state.activeChannelId)}</h2>
+                </div>
+                <span class="online-badge" style="background: rgba(224, 30, 90, 0.15); color: #f43f5e; border-color: rgba(224, 30, 90, 0.3);">
+                  🔒 Private Channel
+                </span>
               </div>
-            `
-              : state.messages.map(renderMessage).join("")
-          }
-        </div>
+            </header>
 
-        <!-- Typing Indicator -->
-        <div class="typing-bar" id="typing-indicator">
-          ${
-            otherTypingUsers.length > 0
-              ? `<span>${escapeHtml(otherTypingUsers.join(", "))} ${otherTypingUsers.length === 1 ? "is" : "are"} typing...</span>`
-              : ""
-          }
-        </div>
+            <!-- Private Channel Lock Barrier -->
+            <div class="private-channel-lock-screen">
+              <div class="lock-icon">🔒</div>
+              <h2>This Channel is Private</h2>
+              <p>
+                You are not an authorized member of <strong>#${escapeHtml(currentChannel.name || state.activeChannelId)}</strong>.
+                All conversations are protected with enterprise AES-256-GCM encryption.
+                Please enter a valid invite code or use an invite link to join.
+              </p>
+              <form id="lock-join-form" class="lock-join-form">
+                <input
+                  type="text"
+                  id="lock-invite-code"
+                  placeholder="Enter Channel Invite Code"
+                  required
+                  autocomplete="off"
+                />
+                <button type="submit" class="primary-btn" style="padding: 10px 18px; white-space: nowrap;">
+                  Unlock & Join
+                </button>
+              </form>
+              <button type="button" id="lock-back-general" class="secondary-btn" style="margin-top: 10px; padding: 8px 16px;">
+                Return to #general
+              </button>
+            </div>
+          `
+            : `
+            <header class="chat-header">
+              <div class="channel-meta">
+                <div class="channel-header-title">
+                  <h2># ${escapeHtml(currentChannel.name)}</h2>
+                </div>
+                <span class="online-badge">
+                  <span class="pulse-dot"></span>
+                  ${state.participants.length} member${state.participants.length === 1 ? "" : "s"}
+                </span>
+              </div>
 
-        <!-- Composer Box -->
-        <div class="chat-composer-container">
-          <!-- Mention Autocomplete Menu -->
-          ${
-            mentionCandidates.length > 0
-              ? `
-              <div class="mention-autocomplete-menu" id="mention-menu">
-                ${mentionCandidates
-                  .map(
-                    (p) => `
-                  <button type="button" class="mention-option-btn" data-mention-username="${escapeHtml(p.username)}">
-                    <span>@</span>
-                    <span>${escapeHtml(p.username)}</span>
-                  </button>
+              <div class="chat-header-actions">
+                <button
+                  type="button"
+                  id="share-invite-btn"
+                  class="share-invite-btn ${state.copiedInvite ? "copied" : ""}"
+                >
+                  <span>${state.copiedInvite ? "✓ Copied!" : "Copy Invite Link"}</span>
+                </button>
+              </div>
+            </header>
+
+            <!-- Messages Stream -->
+            <div id="messages-stream" class="messages-container">
+              ${
+                state.messages.length === 0
+                  ? `
+                  <div style="margin: auto; text-align: center; color: var(--text-muted); padding: 40px 20px;">
+                    <h3 style="color: #fff; margin-bottom: 6px;">Welcome to #${escapeHtml(currentChannel.name)}!</h3>
+                    <p>This room runs in an isolated Cloudflare Durable Object with SQLite. Share messages, upload files, or react with emojis!</p>
+                  </div>
                 `
-                  )
-                  .join("")}
-              </div>
-            `
-              : ""
-          }
-
-          <form id="chat-form" class="composer-box">
-            <!-- Pending Attachment Preview -->
-            ${
-              state.pendingAttachment
-                ? `
-                <div class="composer-attachment-preview">
-                  ${
-                    state.pendingAttachment.type.startsWith("image/")
-                      ? `<img src="${state.pendingAttachment.dataUrl}" class="composer-attachment-thumb" />`
-                      : `<span>📄</span>`
-                  }
-                  <span class="composer-attachment-name">${escapeHtml(state.pendingAttachment.name)} (${formatFileSize(state.pendingAttachment.size)})</span>
-                  <button type="button" id="remove-attachment-btn" class="composer-attachment-remove" title="Remove">&times;</button>
-                </div>
-              `
-                : ""
-            }
-
-            <textarea
-              id="chat-input"
-              class="composer-textarea"
-              placeholder="Message #${escapeHtml(currentChannel.name)} (Type @ to mention)"
-              rows="1"
-            ></textarea>
-
-            <div class="composer-toolbar">
-              <div class="toolbar-group">
-                <!-- File Attach Button -->
-                <input type="file" id="file-input" style="display:none;" />
-                <button type="button" id="attach-file-btn" class="toolbar-btn" title="Attach file or image">
-                  <svg style="width:16px;height:16px;fill:currentColor" viewBox="0 0 24 24"><path d="M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5c0-1.38 1.12-2.5 2.5-2.5s2.5 1.12 2.5 2.5v10.5c0 .55-.45 1-1 1s-1-.45-1-1V6H10v9.5c0 1.38 1.12 2.5 2.5 2.5s2.5-1.12 2.5-2.5V5c0-2.21-1.79-4-4-4S7 2.79 7 5v12.5c0 3.04 2.46 5.5 5.5 5.5s5.5-2.46 5.5-5.5V6h-1.5z"/></svg>
-                </button>
-
-                <!-- Emoji Picker Button -->
-                <button type="button" id="toggle-emoji-btn" class="toolbar-btn" title="Add emoji">
-                  😊
-                </button>
-              </div>
-
-              <div class="toolbar-group">
-                <button type="submit" id="send-msg-btn" class="send-btn" title="Send message (Enter)">
-                  <svg style="width:14px;height:14px;fill:currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
-                </button>
-              </div>
+                  : state.messages.map(renderMessage).join("")
+              }
             </div>
-          </form>
 
-          <!-- Emoji Popover -->
-          ${
-            state.showEmojiPicker
-              ? `
-              <div class="emoji-popover" id="emoji-popover">
-                <div class="emoji-popover-header">Frequently Used Emojis</div>
-                <div class="emoji-grid">
-                  ${SLACK_EMOJIS.map(
-                    (e) => `
-                    <button type="button" class="emoji-item-btn" data-insert-emoji="${e}">${e}</button>
+            <!-- Typing Indicator -->
+            <div class="typing-bar" id="typing-indicator">
+              ${
+                otherTypingUsers.length > 0
+                  ? `<span>${escapeHtml(otherTypingUsers.join(", "))} ${otherTypingUsers.length === 1 ? "is" : "are"} typing...</span>`
+                  : ""
+              }
+            </div>
+
+            <!-- Composer Box -->
+            <div class="chat-composer-container">
+              <!-- Mention Autocomplete Menu -->
+              ${
+                mentionCandidates.length > 0
+                  ? `
+                  <div class="mention-autocomplete-menu" id="mention-menu">
+                    ${mentionCandidates
+                      .map(
+                        (p) => `
+                      <button type="button" class="mention-option-btn" data-mention-username="${escapeHtml(p.username)}">
+                        <span>@</span>
+                        <span>${escapeHtml(p.username)}</span>
+                      </button>
+                    `
+                      )
+                      .join("")}
+                  </div>
+                `
+                  : ""
+              }
+
+              <form id="chat-form" class="composer-box">
+                <!-- Pending Attachment Preview -->
+                ${
+                  state.pendingAttachment
+                    ? `
+                    <div class="composer-attachment-preview">
+                      ${
+                        state.pendingAttachment.type.startsWith("image/")
+                          ? `<img src="${state.pendingAttachment.dataUrl}" class="composer-attachment-thumb" />`
+                          : `<span>📄</span>`
+                      }
+                      <span class="composer-attachment-name">${escapeHtml(state.pendingAttachment.name)} (${formatFileSize(state.pendingAttachment.size)})</span>
+                      <button type="button" id="remove-attachment-btn" class="composer-attachment-remove" title="Remove">&times;</button>
+                    </div>
                   `
-                  ).join("")}
+                    : ""
+                }
+
+                <textarea
+                  id="chat-input"
+                  class="composer-textarea"
+                  placeholder="Message #${escapeHtml(currentChannel.name)} (Type @ to mention)"
+                  rows="1"
+                ></textarea>
+
+                <div class="composer-toolbar">
+                  <div class="toolbar-group">
+                    <!-- File Attach Button -->
+                    <input type="file" id="file-input" style="display:none;" />
+                    <button type="button" id="attach-file-btn" class="toolbar-btn" title="Attach file or image">
+                      <svg style="width:16px;height:16px;fill:currentColor" viewBox="0 0 24 24"><path d="M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5c0-1.38 1.12-2.5 2.5-2.5s2.5 1.12 2.5 2.5v10.5c0 .55-.45 1-1 1s-1-.45-1-1V6H10v9.5c0 1.38 1.12 2.5 2.5 2.5s2.5-1.12 2.5-2.5V5c0-2.21-1.79-4-4-4S7 2.79 7 5v12.5c0 3.04 2.46 5.5 5.5 5.5s5.5-2.46 5.5-5.5V6h-1.5z"/></svg>
+                    </button>
+
+                    <!-- Emoji Picker Button -->
+                    <button type="button" id="toggle-emoji-btn" class="toolbar-btn" title="Add emoji">
+                      😊
+                    </button>
+                  </div>
+
+                  <div class="toolbar-group">
+                    <button type="submit" id="send-msg-btn" class="send-btn" title="Send message (Enter)">
+                      <svg style="width:14px;height:14px;fill:currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+                    </button>
+                  </div>
                 </div>
-              </div>
-            `
-              : ""
-          }
-        </div>
+              </form>
+
+              <!-- Emoji Popover -->
+              ${
+                state.showEmojiPicker
+                  ? `
+                  <div class="emoji-popover" id="emoji-popover">
+                    <div class="emoji-popover-header">Frequently Used Emojis</div>
+                    <div class="emoji-grid">
+                      ${SLACK_EMOJIS.map(
+                        (e) => `
+                        <button type="button" class="emoji-item-btn" data-insert-emoji="${e}">${e}</button>
+                      `
+                      ).join("")}
+                    </div>
+                  </div>
+                `
+                  : ""
+              }
+            </div>
+          `
+        }
       </section>
     </div>
 
@@ -1313,6 +1420,24 @@ const bindEvents = (): void => {
   // Share Invite Link
   const shareInviteBtn = document.getElementById("share-invite-btn");
   if (shareInviteBtn) shareInviteBtn.onclick = handleCopyInviteLink;
+
+  // Lock Barrier Form & Back Button
+  const lockJoinForm = document.getElementById("lock-join-form");
+  if (lockJoinForm) {
+    lockJoinForm.onsubmit = (e) => {
+      e.preventDefault();
+      const codeInput = document.getElementById("lock-invite-code") as HTMLInputElement | null;
+      const code = codeInput?.value?.trim();
+      if (code) joinInviteCodeDirectly(code);
+    };
+  }
+
+  const lockBackGeneral = document.getElementById("lock-back-general");
+  if (lockBackGeneral) {
+    lockBackGeneral.onclick = () => {
+      switchChannel("general");
+    };
+  }
 
   // Reactions: Quick bar and Reaction pills
   const reactionQuickBtns = document.querySelectorAll<HTMLElement>(".reaction-quick-btn");

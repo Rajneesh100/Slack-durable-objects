@@ -14,12 +14,19 @@ import {
   USER_SCHEMA_SQL,
 } from "../storage/user-queries";
 
+interface Env {
+  ROOMS: DurableObjectNamespace;
+  USERS: DurableObjectNamespace;
+}
+
 export class UserDO {
   private readonly state: DurableObjectState;
+  private readonly env?: Env;
   private isInitialized = false;
 
-  constructor(state: DurableObjectState) {
+  constructor(state: DurableObjectState, env?: Env) {
     this.state = state;
+    this.env = env;
   }
 
   private async ensureInitialized(): Promise<void> {
@@ -256,6 +263,18 @@ export class UserDO {
     // Add to user's joined channels
     this.addChannelToUser(userId, roomId);
 
+    // Register creator as owner in RoomDO
+    if (this.env?.ROOMS) {
+      try {
+        const roomStub = this.env.ROOMS.get(this.env.ROOMS.idFromName(roomId));
+        await roomStub.fetch(`http://internal/rooms/${roomId}/add-member`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ userId, role: "owner" }),
+        });
+      } catch {}
+    }
+
     const channelInfo: ChannelInfo = {
       id: roomId,
       name: slug,
@@ -286,6 +305,18 @@ export class UserDO {
 
     const channel = mapChannelRowToInfo(rows[0]);
     this.addChannelToUser(userId, channel.id);
+
+    // Register user as member in RoomDO
+    if (this.env?.ROOMS) {
+      try {
+        const roomStub = this.env.ROOMS.get(this.env.ROOMS.idFromName(channel.id));
+        await roomStub.fetch(`http://internal/rooms/${channel.id}/add-member`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ userId, role: "member" }),
+        });
+      } catch {}
+    }
 
     return Response.json({ channel });
   }

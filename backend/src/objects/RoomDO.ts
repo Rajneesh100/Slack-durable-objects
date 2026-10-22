@@ -1,14 +1,18 @@
 /**
- * RoomDO: Imperative Shell for Real-time Channel Durable Object.
- * Uses WebSocket Hibernation API and Embedded SQLite.
- * Executes effects produced by pure `reduceRoom` state machine.
+ * RoomDO: Secure Imperative Shell for Real-time Channel Durable Object.
+ * Features:
+ * - Enterprise AES-256-GCM message encryption at rest in SQLite
+ * - Strict Channel Membership Authorization (Zero-leakage private channels)
+ * - WebSocket Hibernation & Reactive state machine
  */
 
 import { verifySession } from "../domain/auth-crypto";
+import { decryptWithAESGCM, deriveRoomKey, encryptWithAESGCM } from "../domain/crypto-vault";
 import { initialRoomState, reduceRoom } from "../domain/room-reducer";
 import type {
   ChatMessage,
   ClientMessage,
+  FileAttachment,
   Participant,
   RoomDomainEvent,
   RoomEffect,
@@ -23,26 +27,38 @@ import {
   ROOM_SCHEMA_SQL,
 } from "../storage/room-queries";
 
+interface Env {
+  USERS: DurableObjectNamespace;
+  ROOMS: DurableObjectNamespace;
+}
+
 export class RoomDO {
   private readonly state: DurableObjectState;
+  private readonly env?: Env;
   private roomState: RoomState | null = null;
+  private cryptoKey: CryptoKey | null = null;
   private isInitialized = false;
 
-  constructor(state: DurableObjectState) {
+  constructor(state: DurableObjectState, env?: Env) {
     this.state = state;
+    this.env = env;
   }
 
   private async ensureInitialized(roomId: string, name?: string, inviteCode?: string): Promise<void> {
-    if (this.isInitialized && this.roomState) return;
+    if (this.isInitialized && this.roomState && this.cryptoKey) return;
 
     this.state.storage.sql.exec(ROOM_SCHEMA_SQL);
 
-    // Migration safe check: add attachment_json to messages if not present
+    // Run graceful column migrations if updating an existing database
+    try {
+      this.state.storage.sql.exec("ALTER TABLE messages ADD COLUMN iv TEXT");
+    } catch {}
     try {
       this.state.storage.sql.exec("ALTER TABLE messages ADD COLUMN attachment_json TEXT");
-    } catch {
-      // Column already exists, safe to ignore
-    }
+    } catch {}
+
+    // Derive deterministic AES-256-GCM key for this room
+    this.cryptoKey = await deriveRoomKey(roomId);
 
     // Retrieve or store room metadata
     const metaRows = this.state.storage.sql
@@ -50,7 +66,6 @@ export class RoomDO {
       .toArray() as unknown as { key: string; value: string }[];
 
     const metaMap = new Map(metaRows.map((r) => [r.key, r.value]));
-
     const roomName = name || metaMap.get("name") || roomId;
     const roomInvite = inviteCode || metaMap.get("inviteCode") || roomId;
 
@@ -62,10 +77,10 @@ export class RoomDO {
       );
     }
 
-    // Reconstruct in-memory state from connected hibernated sockets
+    // Reconstruct in-memory state
     this.roomState = initialRoomState(roomId, roomName, roomInvite);
 
-    // Check existing hibernated WebSockets to restore participants
+    // Check existing hibernated WebSockets
     const activeSockets = this.state.getWebSockets();
     const restoredParticipants = new Map<string, Participant>();
 
@@ -95,44 +110,126 @@ export class RoomDO {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const roomId = url.pathname.split("/")[2] || "general";
+    const parts = url.pathname.split("/");
+    const roomId = parts[2] || "general";
+    const action = parts[3] || "";
     const name = url.searchParams.get("name") || undefined;
     const inviteCode = url.searchParams.get("inviteCode") || undefined;
 
     await this.ensureInitialized(roomId, name, inviteCode);
 
-    // WebSocket Upgrade Handler
-    if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
-      return this.handleWebSocketUpgrade(request);
+    // Internal endpoint: Add an authorized member to this channel
+    if (request.method === "POST" && action === "add-member") {
+      const body = (await request.json()) as { userId?: string; role?: string };
+      if (!body.userId) {
+        return Response.json({ error: "userId required" }, { status: 400 });
+      }
+
+      this.state.storage.sql.exec(
+        "INSERT OR REPLACE INTO room_members (user_id, role, joined_at) VALUES (?, ?, ?)",
+        body.userId,
+        body.role || "member",
+        Date.now()
+      );
+      return Response.json({ success: true, roomId, userId: body.userId });
     }
 
-    // REST: Get Recent Messages
-    if (request.method === "GET" && url.pathname.endsWith("/messages")) {
-      const messages = this.getRecentMessages();
+    // WebSocket Upgrade Handler with Strict Authorization
+    if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+      return this.handleWebSocketUpgrade(request, roomId);
+    }
+
+    // REST: Get Recent Messages (Requires authorization)
+    if (request.method === "GET" && action === "messages") {
+      const token = url.searchParams.get("token");
+      if (!token) {
+        return Response.json({ error: "Unauthorized" }, { status: 401 });
+      }
+      const session = await verifySession<UserSession>(token);
+      if (!session || !(await this.isAuthorized(session.userId, roomId))) {
+        return Response.json({ error: "Forbidden: Not a member of this channel" }, { status: 403 });
+      }
+
+      const messages = await this.getRecentMessages();
       return Response.json({ messages });
     }
 
     return new Response("Not found", { status: 404 });
   }
 
-  private async handleWebSocketUpgrade(request: Request): Promise<Response> {
+  private async isAuthorized(userId: string, roomId: string): Promise<boolean> {
+    // Default public channels are accessible to all registered users
+    if (roomId === "general" || roomId === "random") {
+      return true;
+    }
+
+    // Custom channels require explicit membership in SQLite table
+    const rows = this.state.storage.sql
+      .exec("SELECT user_id FROM room_members WHERE user_id = ?", userId)
+      .toArray();
+
+    if (rows.length > 0) return true;
+
+    // Auto-healing fallback with UserDO registry
+    if (this.env?.USERS) {
+      try {
+        const userStub = this.env.USERS.get(this.env.USERS.idFromName("global_user_registry"));
+        const res = await userStub.fetch(`http://internal/me?userId=${encodeURIComponent(userId)}`);
+        if (res.ok) {
+          const data = (await res.json()) as { user?: { joinedChannels?: { id: string }[] } };
+          const hasChannel = data.user?.joinedChannels?.some((c) => c.id === roomId);
+          if (hasChannel) {
+            this.state.storage.sql.exec(
+              "INSERT OR REPLACE INTO room_members (user_id, role, joined_at) VALUES (?, 'member', ?)",
+              userId,
+              Date.now()
+            );
+            return true;
+          }
+        }
+      } catch {}
+    }
+
+    return false;
+  }
+
+  private async handleWebSocketUpgrade(request: Request, roomId: string): Promise<Response> {
     const url = new URL(request.url);
     const token = url.searchParams.get("token");
 
     if (!token) {
-      return new Response("Unauthorized: missing token", { status: 401 });
+      return new Response(JSON.stringify({ error: "Unauthorized: missing token" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
     const session = await verifySession<UserSession>(token);
     if (!session || !session.userId || !session.username) {
-      return new Response("Unauthorized: invalid or expired token", { status: 401 });
+      return new Response(JSON.stringify({ error: "Unauthorized: invalid or expired session" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // Strict Authorization Check: User MUST be an approved member of this room
+    if (!(await this.isAuthorized(session.userId, roomId))) {
+      return new Response(
+        JSON.stringify({
+          error: "FORBIDDEN",
+          message: "Access Denied: You are not an authorized member of this private channel. Please join via invite link.",
+        }),
+        {
+          status: 403,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
     }
 
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
 
-    // Tag the WebSocket with userId and username for hibernation identification
     this.state.acceptWebSocket(server, [session.userId, session.username]);
 
     const participant: Participant = {
@@ -142,14 +239,13 @@ export class RoomDO {
       lastActiveAt: Date.now(),
     };
 
-    // Transition state
     this.dispatch({
       type: "USER_CONNECTED",
       user: participant,
     });
 
-    // Send initial snapshot directly to connecting client
-    const recentMessages = this.getRecentMessages();
+    // Send initial snapshot with decrypted history
+    const recentMessages = await this.getRecentMessages();
     const currentParticipants = this.roomState
       ? Array.from(this.roomState.participants.values())
       : [participant];
@@ -157,9 +253,9 @@ export class RoomDO {
     const snapshot: ServerMessage = {
       type: "ROOM_SNAPSHOT",
       room: {
-        id: this.roomState?.roomId || "general",
-        name: this.roomState?.name || "general",
-        inviteCode: this.roomState?.inviteCode || "general",
+        id: this.roomState?.roomId || roomId,
+        name: this.roomState?.name || roomId,
+        inviteCode: this.roomState?.inviteCode || roomId,
       },
       participants: currentParticipants,
       messages: recentMessages,
@@ -212,7 +308,6 @@ export class RoomDO {
             timestamp: Date.now(),
           });
 
-          // Schedule alarm to prune typing if not already set
           const currentAlarm = await this.state.storage.getAlarm();
           if (currentAlarm === null) {
             await this.state.storage.setAlarm(Date.now() + 4500);
@@ -230,7 +325,6 @@ export class RoomDO {
     const userId = tags[0];
     if (!userId) return;
 
-    // Check if user has any other active connections in this room before announcing departure
     const userSockets = this.state.getWebSockets(userId);
     if (userSockets.length <= 1) {
       this.dispatch({
@@ -245,16 +339,12 @@ export class RoomDO {
   }
 
   async alarm(): Promise<void> {
-    // Pure prune typing transition
     this.dispatch({
       type: "PRUNE_TYPING",
       currentTimestamp: Date.now(),
     });
   }
 
-  /**
-   * Pure Dispatcher: Passes event to pure roomReducer and executes resulting effects.
-   */
   private dispatch(event: RoomDomainEvent): void {
     if (!this.roomState) return;
 
@@ -264,21 +354,44 @@ export class RoomDO {
     this.executeEffects(effects);
   }
 
-  /**
-   * Imperative Effect Interpreter
-   */
-  private executeEffects(effects: readonly RoomEffect[]): void {
+  private async executeEffects(effects: readonly RoomEffect[]): Promise<void> {
     for (const effect of effects) {
       switch (effect.type) {
         case "PERSIST_MESSAGE": {
+          // Encrypt message content with AES-256-GCM before writing to SQLite
+          let ciphertext = effect.message.content;
+          let ivHex: string | null = null;
+
+          if (this.cryptoKey && effect.message.content.length > 0) {
+            const encrypted = await encryptWithAESGCM(effect.message.content, this.cryptoKey);
+            ciphertext = encrypted.ciphertextHex;
+            ivHex = encrypted.ivHex;
+          }
+
+          let attachmentJson: string | null = null;
+          if (effect.message.attachment) {
+            const rawAttachment = JSON.stringify(effect.message.attachment);
+            if (this.cryptoKey) {
+              const encAtt = await encryptWithAESGCM(rawAttachment, this.cryptoKey);
+              attachmentJson = JSON.stringify({
+                encrypted: true,
+                iv: encAtt.ivHex,
+                data: encAtt.ciphertextHex,
+              });
+            } else {
+              attachmentJson = rawAttachment;
+            }
+          }
+
           this.state.storage.sql.exec(
-            "INSERT INTO messages (id, room_id, sender_id, sender_name, content, attachment_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO messages (id, room_id, sender_id, sender_name, content, iv, attachment_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             effect.message.id,
             effect.message.roomId,
             effect.message.senderId,
             effect.message.senderName,
-            effect.message.content,
-            effect.message.attachment ? JSON.stringify(effect.message.attachment) : null,
+            ciphertext,
+            ivHex,
+            attachmentJson,
             effect.message.createdAt
           );
           break;
@@ -310,7 +423,6 @@ export class RoomDO {
             );
           }
 
-          // Broadcast updated reactions for this message to everyone
           const allReactions = this.state.storage.sql
             .exec("SELECT user_id FROM reactions WHERE message_id = ? AND emoji = ?", effect.messageId, effect.emoji)
             .toArray() as { user_id: string }[];
@@ -333,9 +445,7 @@ export class RoomDO {
           for (const ws of this.state.getWebSockets()) {
             try {
               ws.send(payload);
-            } catch {
-              // Hibernated or dropped connection handled on next wake
-            }
+            } catch {}
           }
           break;
         }
@@ -347,9 +457,7 @@ export class RoomDO {
             if (tags[0] !== effect.excludeUserId) {
               try {
                 ws.send(payload);
-              } catch {
-                // Ignore dropped socket
-              }
+              } catch {}
             }
           }
           break;
@@ -360,9 +468,7 @@ export class RoomDO {
           for (const ws of this.state.getWebSockets(effect.userId)) {
             try {
               ws.send(payload);
-            } catch {
-              // Ignore dropped socket
-            }
+            } catch {}
           }
           break;
         }
@@ -370,10 +476,10 @@ export class RoomDO {
     }
   }
 
-  private getRecentMessages(limit = 100): readonly ChatMessage[] {
+  private async getRecentMessages(limit = 100): Promise<readonly ChatMessage[]> {
     const rows = this.state.storage.sql
       .exec(
-        "SELECT id, room_id, sender_id, sender_name, content, attachment_json, created_at FROM messages ORDER BY created_at ASC LIMIT ?",
+        "SELECT id, room_id, sender_id, sender_name, content, iv, attachment_json, created_at FROM messages ORDER BY created_at ASC LIMIT ?",
         limit
       )
       .toArray() as unknown as MessageRow[];
@@ -396,6 +502,41 @@ export class RoomDO {
       record[r.emoji]!.push(r.user_id);
     }
 
-    return rows.map((row) => mapMessageRowToChatMessage(row, reactionsMap.get(row.id)));
+    // Decrypt messages with AES-GCM
+    const decryptedMessages: ChatMessage[] = [];
+    for (const row of rows) {
+      let content = row.content;
+      if (row.iv && this.cryptoKey) {
+        content = await decryptWithAESGCM(row.content, row.iv, this.cryptoKey);
+      }
+
+      let attachment: FileAttachment | undefined;
+      if (row.attachment_json) {
+        try {
+          const parsed = JSON.parse(row.attachment_json);
+          if (parsed && parsed.encrypted && parsed.iv && parsed.data && this.cryptoKey) {
+            const decryptedJson = await decryptWithAESGCM(parsed.data, parsed.iv, this.cryptoKey);
+            attachment = JSON.parse(decryptedJson) as FileAttachment;
+          } else {
+            attachment = parsed as FileAttachment;
+          }
+        } catch {
+          attachment = undefined;
+        }
+      }
+
+      decryptedMessages.push({
+        id: row.id,
+        roomId: row.room_id,
+        senderId: row.sender_id,
+        senderName: row.sender_name,
+        content,
+        attachment,
+        reactions: reactionsMap.get(row.id),
+        createdAt: row.created_at,
+      });
+    }
+
+    return decryptedMessages;
   }
 }
