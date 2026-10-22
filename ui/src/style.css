@@ -561,7 +561,6 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  scroll-behavior: smooth;
 }
 
 .message-item {

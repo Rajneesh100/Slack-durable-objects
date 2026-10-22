@@ -487,9 +487,15 @@ const updateState = (updater: (prev: AppState) => AppState): void => {
     currentDrafts[`thread:${state.activeThreadParentId}`] = threadInput.value;
   }
 
-  // Preserve scroll positions to eliminate jump/flicker
+  // Check if containers were at or near the bottom before rendering
   const messagesStream = document.getElementById("messages-stream");
   const threadStream = document.getElementById("thread-messages-stream");
+  const isChatAtBottom = messagesStream
+    ? messagesStream.scrollHeight - messagesStream.scrollTop - messagesStream.clientHeight < 60
+    : true;
+  const isThreadAtBottom = threadStream
+    ? threadStream.scrollHeight - threadStream.scrollTop - threadStream.clientHeight < 60
+    : true;
   const chatScrollTop = messagesStream ? messagesStream.scrollTop : null;
   const threadScrollTop = threadStream ? threadStream.scrollTop : null;
 
@@ -506,14 +512,23 @@ const updateState = (updater: (prev: AppState) => AppState): void => {
   state = updater({ ...state, drafts: currentDrafts });
   renderApp();
 
-  // Restore scroll positions accurately
-  if (chatScrollTop !== null) {
-    const newChat = document.getElementById("messages-stream");
-    if (newChat) newChat.scrollTop = chatScrollTop;
+  // Restore scroll positions: if user was at bottom, stay pinned to bottom without bouncing!
+  const newChat = document.getElementById("messages-stream");
+  if (newChat) {
+    if (isChatAtBottom) {
+      newChat.scrollTop = newChat.scrollHeight;
+    } else if (chatScrollTop !== null) {
+      newChat.scrollTop = chatScrollTop;
+    }
   }
-  if (threadScrollTop !== null) {
-    const newThread = document.getElementById("thread-messages-stream");
-    if (newThread) newThread.scrollTop = threadScrollTop;
+
+  const newThread = document.getElementById("thread-messages-stream");
+  if (newThread) {
+    if (isThreadAtBottom) {
+      newThread.scrollTop = newThread.scrollHeight;
+    } else if (threadScrollTop !== null) {
+      newThread.scrollTop = threadScrollTop;
+    }
   }
 
   // Restore focus and cursor seamlessly
@@ -854,23 +869,27 @@ const sendChatMessage = (content: string, parentId?: string): void => {
   if (parentId) {
     const nextDrafts = { ...state.drafts };
     delete nextDrafts[`thread:${parentId}`];
-    updateState((s) => ({
-      ...s,
-      drafts: nextDrafts,
-      threadPendingAttachment: null,
-      showThreadEmojiPicker: false,
-    }));
+    state = { ...state, drafts: nextDrafts };
+    if (state.threadPendingAttachment || state.showThreadEmojiPicker) {
+      updateState((s) => ({
+        ...s,
+        threadPendingAttachment: null,
+        showThreadEmojiPicker: false,
+      }));
+    }
   } else {
     const nextDrafts = { ...state.drafts };
     delete nextDrafts[state.activeChannelId];
-    updateState((s) => ({
-      ...s,
-      drafts: nextDrafts,
-      pendingAttachment: null,
-      showEmojiPicker: false,
-      mentionQuery: null,
-    }));
+    state = { ...state, drafts: nextDrafts };
     sendTypingSignal(false);
+    if (state.pendingAttachment || state.showEmojiPicker || state.mentionQuery !== null) {
+      updateState((s) => ({
+        ...s,
+        pendingAttachment: null,
+        showEmojiPicker: false,
+        mentionQuery: null,
+      }));
+    }
   }
 };
 
@@ -945,12 +964,10 @@ const closeThread = (): void => {
 };
 
 const scrollThreadToBottom = (): void => {
-  requestAnimationFrame(() => {
-    const threadStream = document.getElementById("thread-messages-stream");
-    if (threadStream) {
-      threadStream.scrollTop = threadStream.scrollHeight;
-    }
-  });
+  const threadStream = document.getElementById("thread-messages-stream");
+  if (threadStream) {
+    threadStream.scrollTop = threadStream.scrollHeight;
+  }
 };
 
 const insertEmojiIntoInput = (emoji: string, target: "main" | "thread"): void => {
@@ -1003,10 +1020,10 @@ const sendTypingSignal = (isTyping: boolean): void => {
 };
 
 const scrollChatToBottom = (): void => {
-  requestAnimationFrame(() => {
-    const container = document.getElementById("messages-stream");
-    if (container) container.scrollTop = container.scrollHeight;
-  });
+  const container = document.getElementById("messages-stream");
+  if (container) {
+    container.scrollTop = container.scrollHeight;
+  }
 };
 
 // ==========================================================================
