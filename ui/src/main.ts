@@ -634,33 +634,82 @@ const navigateToMessage = async (roomId: string, messageId: string, parentId?: s
     alertToast: null,
   }));
 
-  if (state.activeChannelId !== roomId) {
-    switchChannel(roomId);
-    await new Promise((r) => setTimeout(r, 220));
+  let cleanMsgId = (messageId || "").trim();
+  if (cleanMsgId.startsWith("reply_")) {
+    cleanMsgId = cleanMsgId.replace(/^reply_/, "");
+  } else if (cleanMsgId.startsWith("react_")) {
+    const parts = cleanMsgId.split("_");
+    if (parts.length >= 2) {
+      cleanMsgId = parts[1];
+    }
   }
 
-  if (parentId) {
-    await openThread(parentId);
-    setTimeout(() => {
-      const el = document.querySelector(`[data-message-id="${messageId}"]`) as HTMLElement | null;
-      if (el) {
-        el.scrollIntoView({ behavior: "smooth", block: "center" });
-        el.classList.remove("highlight-flash");
-        void el.offsetWidth;
-        el.classList.add("highlight-flash");
+  // If old synthetic activity id with no actual message id, simply switch to channel
+  if (cleanMsgId.startsWith("act_")) {
+    if (state.activeChannelId !== roomId) {
+      switchChannel(roomId);
+    }
+    return;
+  }
+
+  let resolvedParentId = parentId;
+  let preloadedRoot: ChatMessage | null = null;
+  let preloadedReplies: readonly ChatMessage[] | null = null;
+
+  // If parentId was not passed, resolve whether this message belongs to a thread
+  if (!resolvedParentId && cleanMsgId) {
+    const localThreadMsg = state.threadMessages.find((m) => m.id === cleanMsgId);
+    if (localThreadMsg?.parentId) {
+      resolvedParentId = localThreadMsg.parentId;
+    } else {
+      const localChannelMsg = state.messages.find((m) => m.id === cleanMsgId);
+      if (localChannelMsg?.parentId) {
+        resolvedParentId = localChannelMsg.parentId;
       }
-    }, 160);
+    }
+
+    if (!resolvedParentId) {
+      try {
+        const res = await fetch(
+          `/api/channels/${encodeURIComponent(roomId)}/messages?token=${encodeURIComponent(state.token || "")}&messageId=${encodeURIComponent(cleanMsgId)}`
+        );
+        if (res.ok) {
+          const data = await res.json();
+          if (data.parentId) {
+            resolvedParentId = data.parentId;
+          }
+          if (data.rootMessage) {
+            preloadedRoot = data.rootMessage;
+          }
+          if (data.messages && data.messages.length > 0) {
+            preloadedReplies = data.messages;
+          }
+        }
+      } catch (err) {
+        console.debug("Failed to query message details from server:", err);
+      }
+    }
+  }
+
+  if (resolvedParentId) {
+    // Open exact thread and highlight target message like Slack!
+    await openThread(resolvedParentId, roomId, cleanMsgId, preloadedRoot, preloadedReplies || undefined);
   } else {
+    // Top-level message in channel
+    if (state.activeChannelId !== roomId) {
+      switchChannel(roomId);
+      await new Promise((r) => setTimeout(r, 220));
+    }
     setTimeout(() => {
-      const el = (document.getElementById(`msg-${messageId}`) ||
-        document.querySelector(`[data-message-id="${messageId}"]`)) as HTMLElement | null;
+      const el = (document.getElementById(`msg-${cleanMsgId}`) ||
+        document.querySelector(`[data-message-id="${cleanMsgId}"]`)) as HTMLElement | null;
       if (el) {
         el.scrollIntoView({ behavior: "smooth", block: "center" });
         el.classList.remove("highlight-flash");
         void el.offsetWidth;
         el.classList.add("highlight-flash");
       }
-    }, 120);
+    }, 180);
   }
 };
 
@@ -1263,28 +1312,85 @@ const submitThreadMessage = (): void => {
   }
 };
 
-const openThread = async (messageId: string): Promise<void> => {
-  updateState((s) => ({
-    ...s,
-    activeThreadParentId: messageId,
-    threadMessages: [],
-    isThreadLoading: true,
-    showEmojiPicker: false,
-    showThreadEmojiPicker: false,
-  }));
+const openThread = async (
+  parentId: string,
+  channelId?: string,
+  highlightMessageId?: string,
+  preloadedRoot?: ChatMessage | null,
+  preloadedReplies?: readonly ChatMessage[]
+): Promise<void> => {
+  const targetChannel = channelId || state.activeChannelId;
+
+  if (state.activeChannelId !== targetChannel) {
+    switchChannel(targetChannel);
+    await new Promise((r) => setTimeout(r, 120));
+  }
+
+  const hasPreloaded = Array.isArray(preloadedReplies) && preloadedReplies.length > 0;
+
+  updateState((s) => {
+    const rootMsg = preloadedRoot;
+    const nextMessages =
+      rootMsg && !s.messages.some((m) => m.id === rootMsg.id)
+        ? [rootMsg, ...s.messages]
+        : s.messages;
+
+    return {
+      ...s,
+      isViewingMentions: false,
+      activeChannelId: targetChannel,
+      activeThreadParentId: parentId,
+      threadMessages: hasPreloaded ? preloadedReplies! : [],
+      messages: nextMessages,
+      isThreadLoading: !hasPreloaded,
+      showEmojiPicker: false,
+      showThreadEmojiPicker: false,
+    };
+  });
+
+  const scrollAndHighlight = (targetId: string) => {
+    setTimeout(() => {
+      const pane = document.getElementById("thread-pane");
+      const el = (pane?.querySelector(`[data-message-id="${targetId}"]`) ||
+        pane?.querySelector(`#msg-${targetId}`)) as HTMLElement | null;
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        el.classList.remove("highlight-flash");
+        void el.offsetWidth;
+        el.classList.add("highlight-flash");
+      } else {
+        scrollThreadToBottom();
+      }
+    }, 180);
+  };
+
+  const targetId = highlightMessageId || parentId;
+
+  if (hasPreloaded) {
+    scrollAndHighlight(targetId);
+    return;
+  }
 
   try {
     const res = await fetch(
-      `/api/channels/${encodeURIComponent(state.activeChannelId)}/messages?token=${encodeURIComponent(state.token || "")}&parentId=${encodeURIComponent(messageId)}`
+      `/api/channels/${encodeURIComponent(targetChannel)}/messages?token=${encodeURIComponent(state.token || "")}&parentId=${encodeURIComponent(parentId)}`
     );
     if (res.ok) {
       const data = await res.json();
-      updateState((s) => ({
-        ...s,
-        threadMessages: data.messages || [],
-        isThreadLoading: false,
-      }));
-      scrollThreadToBottom();
+      updateState((s) => {
+        const rootMsg = data.rootMessage || preloadedRoot;
+        const nextMessages =
+          rootMsg && !s.messages.some((m) => m.id === rootMsg.id)
+            ? [rootMsg, ...s.messages]
+            : s.messages;
+        return {
+          ...s,
+          messages: nextMessages,
+          threadMessages: data.messages || [],
+          isThreadLoading: false,
+        };
+      });
+      scrollAndHighlight(targetId);
     } else {
       updateState((s) => ({ ...s, isThreadLoading: false }));
     }
@@ -2088,6 +2194,13 @@ const renderThreadPanel = (): string => {
           </div>
           <div class="thread-divider">
             <span>${state.threadMessages.length} ${state.threadMessages.length === 1 ? "reply" : "replies"}</span>
+          </div>
+        `
+            : state.isThreadLoading
+            ? `
+          <div class="thread-root-card" style="padding: 16px; color: var(--text-muted); font-size: 13px; text-align: center;">
+            <div style="margin-bottom: 6px;">⏳</div>
+            Loading thread conversation...
           </div>
         `
             : ""
@@ -3089,7 +3202,16 @@ const pollChannelActivity = async (): Promise<void> => {
     if (!res.ok) return;
     const data = await res.json();
     const activities = data.activities as
-      | Record<string, { lastMessageAt: number; lastSender: string; snippet: string }>
+      | Record<
+          string,
+          {
+            lastMessageAt: number;
+            lastSender: string;
+            snippet: string;
+            messageId?: string;
+            parentId?: string;
+          }
+        >
       | undefined;
     if (!activities) return;
 
@@ -3125,30 +3247,47 @@ const pollChannelActivity = async (): Promise<void> => {
           hasChange = true;
         }
 
-        if (
+        const isMention =
           act.snippet &&
           isMentioningUser(act.snippet, state.user.username) &&
-          act.lastSender !== state.user.username
-        ) {
+          act.lastSender !== state.user.username;
+        const isThreadReply = Boolean(act.parentId) && act.lastSender !== state.user.username;
+
+        if (isMention || isThreadReply) {
           if (!nextMentions[roomId]) {
             nextMentions[roomId] = true;
             hasChange = true;
 
             const ch = state.channels.find((c) => c.id === roomId);
             const chName = ch ? ch.name : roomId;
+            const msgId = act.messageId || `act_${roomId}_${act.lastMessageAt}`;
             const exists = nextMentionsList.some(
-              (m) => m.roomId === roomId && m.createdAt === act.lastMessageAt
+              (m) =>
+                (m.messageId && m.messageId === act.messageId) ||
+                (m.roomId === roomId && m.createdAt === act.lastMessageAt)
             );
             if (!exists) {
               nextMentionsList.unshift({
-                id: `act_${roomId}_${act.lastMessageAt}`,
+                id: msgId,
+                messageId: act.messageId,
+                parentId: act.parentId,
                 roomId,
                 roomName: chName,
                 senderName: act.lastSender,
-                content: act.snippet,
+                content: isThreadReply ? `💬 Replied in thread: "${act.snippet}"` : act.snippet,
                 createdAt: act.lastMessageAt,
+                type: isThreadReply ? "thread_reply" : "mention",
               });
-              showSlackAlertToast(`@${act.lastSender} mentioned you in #${chName}`, act.snippet, roomId);
+              showSlackAlertToast(
+                isThreadReply
+                  ? `@${act.lastSender} replied in thread in #${chName}`
+                  : `@${act.lastSender} mentioned you in #${chName}`,
+                act.snippet,
+                roomId,
+                act.messageId,
+                act.parentId,
+                isThreadReply ? "💬" : "🔔"
+              );
             }
           }
         }

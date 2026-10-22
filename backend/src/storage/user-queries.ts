@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS channel_activity (
   room_id TEXT PRIMARY KEY,
   last_message_at INTEGER NOT NULL,
   last_sender TEXT NOT NULL,
-  snippet TEXT NOT NULL
+  snippet TEXT NOT NULL,
+  message_id TEXT,
+  parent_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);

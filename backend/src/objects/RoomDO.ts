@@ -174,8 +174,41 @@ export class RoomDO {
       }
 
       const parentId = url.searchParams.get("parentId") || undefined;
+      const messageId = url.searchParams.get("messageId") || undefined;
       const limit = parseInt(url.searchParams.get("limit") || "100", 10);
-      const messages = await this.getRecentMessages({ parentId, limit });
+
+      // Look up specific message (and its thread if it is a reply)
+      if (messageId) {
+        const targetMsg = await this.getMessageById(messageId);
+        if (!targetMsg) {
+          return Response.json({ error: "Message not found" }, { status: 404 });
+        }
+        if (targetMsg.parentId) {
+          const rootMessage = await this.getMessageById(targetMsg.parentId);
+          const replies = await this.getRecentMessages({ parentId: targetMsg.parentId, limit: 100 });
+          return Response.json({
+            message: targetMsg,
+            parentId: targetMsg.parentId,
+            rootMessage,
+            messages: replies,
+          });
+        }
+        return Response.json({
+          message: targetMsg,
+          parentId: null,
+          rootMessage: targetMsg,
+          messages: [targetMsg],
+        });
+      }
+
+      // Fetch thread replies plus the root message
+      if (parentId) {
+        const rootMessage = await this.getMessageById(parentId);
+        const messages = await this.getRecentMessages({ parentId, limit });
+        return Response.json({ messages, rootMessage });
+      }
+
+      const messages = await this.getRecentMessages({ limit });
       return Response.json({ messages });
     }
 
@@ -475,6 +508,8 @@ export class RoomDO {
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({
                     roomId: effect.message.roomId,
+                    messageId: effect.message.id,
+                    parentId: effect.message.parentId || null,
                     senderName: effect.message.senderName,
                     snippet: effect.message.content.slice(0, 100),
                     timestamp: effect.message.createdAt,
@@ -598,33 +633,28 @@ export class RoomDO {
     }
   }
 
-  private async getRecentMessages(options?: { parentId?: string; limit?: number }): Promise<readonly ChatMessage[]> {
-    const limit = options?.limit || 100;
-    const parentId = options?.parentId;
-
-    let rows: MessageRow[];
-    if (parentId) {
-      rows = this.state.storage.sql
-        .exec(
-          "SELECT id, room_id, sender_id, sender_name, content, iv, attachment_json, parent_id, created_at FROM messages WHERE parent_id = ? ORDER BY created_at ASC LIMIT ?",
-          parentId,
-          limit
-        )
-        .toArray() as unknown as MessageRow[];
-    } else {
-      rows = this.state.storage.sql
-        .exec(
-          "SELECT id, room_id, sender_id, sender_name, content, iv, attachment_json, parent_id, created_at FROM messages WHERE parent_id IS NULL ORDER BY created_at ASC LIMIT ?",
-          limit
-        )
-        .toArray() as unknown as MessageRow[];
+  private async getMessageById(messageId: string): Promise<ChatMessage | null> {
+    if (this.messageCache.has(messageId)) {
+      return this.messageCache.get(messageId)!;
     }
+    const rows = this.state.storage.sql
+      .exec(
+        "SELECT id, room_id, sender_id, sender_name, content, iv, attachment_json, parent_id, created_at FROM messages WHERE id = ?",
+        messageId
+      )
+      .toArray() as unknown as MessageRow[];
+    if (rows.length === 0) return null;
 
+    const msgs = await this.decryptRows(rows, true);
+    return msgs[0] || null;
+  }
+
+  private async decryptRows(rows: MessageRow[], isThread = false): Promise<readonly ChatMessage[]> {
     if (rows.length === 0) return [];
 
     // Fast aggregation for thread reply counts and timestamps (only needed for top-level messages)
     const replyStatsMap = new Map<string, { count: number; lastReplyAt: number }>();
-    if (!parentId) {
+    if (!isThread) {
       try {
         const replyStats = this.state.storage.sql
           .exec(
@@ -712,5 +742,30 @@ export class RoomDO {
     }
 
     return decryptedMessages;
+  }
+
+  private async getRecentMessages(options?: { parentId?: string; limit?: number }): Promise<readonly ChatMessage[]> {
+    const limit = options?.limit || 100;
+    const parentId = options?.parentId;
+
+    let rows: MessageRow[];
+    if (parentId) {
+      rows = this.state.storage.sql
+        .exec(
+          "SELECT id, room_id, sender_id, sender_name, content, iv, attachment_json, parent_id, created_at FROM messages WHERE parent_id = ? ORDER BY created_at ASC LIMIT ?",
+          parentId,
+          limit
+        )
+        .toArray() as unknown as MessageRow[];
+    } else {
+      rows = this.state.storage.sql
+        .exec(
+          "SELECT id, room_id, sender_id, sender_name, content, iv, attachment_json, parent_id, created_at FROM messages WHERE parent_id IS NULL ORDER BY created_at ASC LIMIT ?",
+          limit
+        )
+        .toArray() as unknown as MessageRow[];
+    }
+
+    return this.decryptRows(rows, Boolean(parentId));
   }
 }

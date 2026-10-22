@@ -57,6 +57,14 @@ export class UserDO {
       }
     }
 
+    // Migration for channel_activity columns
+    try {
+      this.state.storage.sql.exec("ALTER TABLE channel_activity ADD COLUMN message_id TEXT");
+    } catch {}
+    try {
+      this.state.storage.sql.exec("ALTER TABLE channel_activity ADD COLUMN parent_id TEXT");
+    } catch {}
+
     this.isInitialized = true;
   }
 
@@ -364,17 +372,21 @@ export class UserDO {
     try {
       const body = (await request.json()) as {
         roomId?: string;
+        messageId?: string;
+        parentId?: string | null;
         senderName?: string;
         snippet?: string;
         timestamp?: number;
       };
       if (body.roomId) {
         this.state.storage.sql.exec(
-          "INSERT OR REPLACE INTO channel_activity (room_id, last_message_at, last_sender, snippet) VALUES (?, ?, ?, ?)",
+          "INSERT OR REPLACE INTO channel_activity (room_id, last_message_at, last_sender, snippet, message_id, parent_id) VALUES (?, ?, ?, ?, ?, ?)",
           body.roomId,
           body.timestamp || Date.now(),
           body.senderName || "Unknown",
-          body.snippet || ""
+          body.snippet || "",
+          body.messageId || null,
+          body.parentId || null
         );
       }
       return Response.json({ success: true });
@@ -386,15 +398,17 @@ export class UserDO {
   private async handleActivityFeed(): Promise<Response> {
     try {
       const rows = this.state.storage.sql
-        .exec("SELECT room_id, last_message_at, last_sender, snippet FROM channel_activity")
-        .toArray() as unknown as { room_id: string; last_message_at: number; last_sender: string; snippet: string }[];
+        .exec("SELECT room_id, last_message_at, last_sender, snippet, message_id, parent_id FROM channel_activity")
+        .toArray() as unknown as { room_id: string; last_message_at: number; last_sender: string; snippet: string; message_id: string | null; parent_id: string | null }[];
 
-      const activities: Record<string, { lastMessageAt: number; lastSender: string; snippet: string }> = {};
+      const activities: Record<string, { lastMessageAt: number; lastSender: string; snippet: string; messageId?: string; parentId?: string }> = {};
       for (const r of rows) {
         activities[r.room_id] = {
           lastMessageAt: r.last_message_at,
           lastSender: r.last_sender,
           snippet: r.snippet,
+          messageId: r.message_id || undefined,
+          parentId: r.parent_id || undefined,
         };
       }
       return Response.json({ activities });
