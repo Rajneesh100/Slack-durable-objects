@@ -45,6 +45,9 @@ export interface ChatMessage {
   readonly content: string;
   readonly attachment?: FileAttachment;
   readonly reactions?: Readonly<Record<string, readonly UserId[]>>; // emoji -> array of userIds
+  readonly parentId?: MessageId; // For Slack thread replies
+  readonly replyCount?: number;  // Total thread replies for top-level message
+  readonly lastReplyAt?: number; // Latest thread reply timestamp
   readonly createdAt: number;
 }
 
@@ -66,7 +69,7 @@ export interface RoomState {
 // Client to Server WebSocket Protocol
 export type ClientMessage =
   | { readonly type: "JOIN"; readonly token: string }
-  | { readonly type: "SEND_MESSAGE"; readonly content: string; readonly attachment?: FileAttachment; readonly tempId?: string }
+  | { readonly type: "SEND_MESSAGE"; readonly content: string; readonly attachment?: FileAttachment; readonly parentId?: MessageId; readonly tempId?: string }
   | { readonly type: "TOGGLE_REACTION"; readonly messageId: MessageId; readonly emoji: string }
   | { readonly type: "TYPING"; readonly isTyping: boolean };
 
@@ -95,6 +98,7 @@ export type RoomDomainEvent =
       readonly content: string;
       readonly attachment?: FileAttachment;
       readonly messageId: MessageId;
+      readonly parentId?: MessageId;
       readonly timestamp: number;
     }
   | {

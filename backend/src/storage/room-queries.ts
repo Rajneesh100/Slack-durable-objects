@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS messages (
   content TEXT NOT NULL,
   iv TEXT,
   attachment_json TEXT,
+  parent_id TEXT,
   created_at INTEGER NOT NULL
 );
 
@@ -36,6 +37,8 @@ CREATE TABLE IF NOT EXISTS reactions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id);
+CREATE INDEX IF NOT EXISTS idx_messages_room_parent ON messages(room_id, parent_id, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_reactions_msg ON reactions(message_id);
 CREATE INDEX IF NOT EXISTS idx_room_members_user ON room_members(user_id);
 `;
@@ -48,6 +51,7 @@ export interface MessageRow {
   content: string;
   iv?: string | null;
   attachment_json?: string | null;
+  parent_id?: string | null;
   created_at: number;
 }
 
@@ -66,7 +70,9 @@ export interface RoomMemberRow {
 export const mapMessageRowToChatMessage = (
   row: MessageRow,
   decryptedContent: string,
-  reactionsMap?: Record<string, string[]>
+  reactionsMap?: Record<string, string[]>,
+  replyCount?: number,
+  lastReplyAt?: number
 ): ChatMessage => {
   let attachment: FileAttachment | undefined;
   if (row.attachment_json) {
@@ -85,6 +91,9 @@ export const mapMessageRowToChatMessage = (
     content: decryptedContent,
     attachment,
     reactions: reactionsMap,
+    parentId: row.parent_id || undefined,
+    replyCount,
+    lastReplyAt,
     createdAt: row.created_at,
   };
 };

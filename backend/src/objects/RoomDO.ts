@@ -37,6 +37,7 @@ export class RoomDO {
   private readonly env?: Env;
   private roomState: RoomState | null = null;
   private cryptoKey: CryptoKey | null = null;
+  private messageCache = new Map<string, ChatMessage>();
   private isInitialized = false;
 
   constructor(state: DurableObjectState, env?: Env) {
@@ -55,6 +56,13 @@ export class RoomDO {
     } catch {}
     try {
       this.state.storage.sql.exec("ALTER TABLE messages ADD COLUMN attachment_json TEXT");
+    } catch {}
+    try {
+      this.state.storage.sql.exec("ALTER TABLE messages ADD COLUMN parent_id TEXT");
+    } catch {}
+    try {
+      this.state.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id)");
+      this.state.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_messages_room_parent ON messages(room_id, parent_id, created_at ASC)");
     } catch {}
 
     // Derive deterministic AES-256-GCM key for this room
@@ -139,7 +147,7 @@ export class RoomDO {
       return this.handleWebSocketUpgrade(request, roomId);
     }
 
-    // REST: Get Recent Messages (Requires authorization)
+    // REST: Get Recent Messages or Thread Replies (Requires authorization)
     if (request.method === "GET" && action === "messages") {
       const token = url.searchParams.get("token");
       if (!token) {
@@ -150,7 +158,9 @@ export class RoomDO {
         return Response.json({ error: "Forbidden: Not a member of this channel" }, { status: 403 });
       }
 
-      const messages = await this.getRecentMessages();
+      const parentId = url.searchParams.get("parentId") || undefined;
+      const limit = parseInt(url.searchParams.get("limit") || "100", 10);
+      const messages = await this.getRecentMessages({ parentId, limit });
       return Response.json({ messages });
     }
 
@@ -244,7 +254,7 @@ export class RoomDO {
       user: participant,
     });
 
-    // Send initial snapshot with decrypted history
+    // Send initial snapshot with top-level decrypted history and reply counts
     const recentMessages = await this.getRecentMessages();
     const currentParticipants = this.roomState
       ? Array.from(this.roomState.participants.values())
@@ -285,6 +295,7 @@ export class RoomDO {
             content: parsed.content,
             attachment: parsed.attachment,
             messageId: "msg_" + crypto.randomUUID().slice(0, 12),
+            parentId: parsed.parentId,
             timestamp: Date.now(),
           });
           break;
@@ -384,7 +395,7 @@ export class RoomDO {
           }
 
           this.state.storage.sql.exec(
-            "INSERT INTO messages (id, room_id, sender_id, sender_name, content, iv, attachment_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO messages (id, room_id, sender_id, sender_name, content, iv, attachment_json, parent_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             effect.message.id,
             effect.message.roomId,
             effect.message.senderId,
@@ -392,8 +403,22 @@ export class RoomDO {
             ciphertext,
             ivHex,
             attachmentJson,
+            effect.message.parentId || null,
             effect.message.createdAt
           );
+
+          // Update in-memory message cache
+          this.messageCache.set(effect.message.id, effect.message);
+
+          // If this is a thread reply, increment replyCount of parent in cache
+          if (effect.message.parentId && this.messageCache.has(effect.message.parentId)) {
+            const parent = this.messageCache.get(effect.message.parentId)!;
+            this.messageCache.set(effect.message.parentId, {
+              ...parent,
+              replyCount: (parent.replyCount || 0) + 1,
+              lastReplyAt: effect.message.createdAt,
+            });
+          }
           break;
         }
 
@@ -428,6 +453,18 @@ export class RoomDO {
             .toArray() as { user_id: string }[];
 
           const userIds = allReactions.map((r) => r.user_id);
+
+          // Keep in-memory cache updated
+          if (this.messageCache.has(effect.messageId)) {
+            const cached = this.messageCache.get(effect.messageId)!;
+            const updatedReactions = { ...(cached.reactions || {}) };
+            if (userIds.length > 0) {
+              updatedReactions[effect.emoji] = userIds;
+            } else {
+              delete updatedReactions[effect.emoji];
+            }
+            this.messageCache.set(effect.messageId, { ...cached, reactions: updatedReactions });
+          }
 
           const broadcastMsg: ServerMessage = {
             type: "REACTION_UPDATED",
@@ -476,15 +513,45 @@ export class RoomDO {
     }
   }
 
-  private async getRecentMessages(limit = 100): Promise<readonly ChatMessage[]> {
-    const rows = this.state.storage.sql
-      .exec(
-        "SELECT id, room_id, sender_id, sender_name, content, iv, attachment_json, created_at FROM messages ORDER BY created_at ASC LIMIT ?",
-        limit
-      )
-      .toArray() as unknown as MessageRow[];
+  private async getRecentMessages(options?: { parentId?: string; limit?: number }): Promise<readonly ChatMessage[]> {
+    const limit = options?.limit || 100;
+    const parentId = options?.parentId;
+
+    let rows: MessageRow[];
+    if (parentId) {
+      rows = this.state.storage.sql
+        .exec(
+          "SELECT id, room_id, sender_id, sender_name, content, iv, attachment_json, parent_id, created_at FROM messages WHERE parent_id = ? ORDER BY created_at ASC LIMIT ?",
+          parentId,
+          limit
+        )
+        .toArray() as unknown as MessageRow[];
+    } else {
+      rows = this.state.storage.sql
+        .exec(
+          "SELECT id, room_id, sender_id, sender_name, content, iv, attachment_json, parent_id, created_at FROM messages WHERE parent_id IS NULL ORDER BY created_at ASC LIMIT ?",
+          limit
+        )
+        .toArray() as unknown as MessageRow[];
+    }
 
     if (rows.length === 0) return [];
+
+    // Fast aggregation for thread reply counts and timestamps (only needed for top-level messages)
+    const replyStatsMap = new Map<string, { count: number; lastReplyAt: number }>();
+    if (!parentId) {
+      try {
+        const replyStats = this.state.storage.sql
+          .exec(
+            "SELECT parent_id, COUNT(*) as reply_count, MAX(created_at) as last_reply_at FROM messages WHERE parent_id IS NOT NULL GROUP BY parent_id"
+          )
+          .toArray() as unknown as { parent_id: string; reply_count: number; last_reply_at: number }[];
+
+        for (const r of replyStats) {
+          replyStatsMap.set(r.parent_id, { count: r.reply_count, lastReplyAt: r.last_reply_at });
+        }
+      } catch {}
+    }
 
     const reactionRows = this.state.storage.sql
       .exec("SELECT message_id, user_id, emoji FROM reactions")
@@ -502,9 +569,25 @@ export class RoomDO {
       record[r.emoji]!.push(r.user_id);
     }
 
-    // Decrypt messages with AES-GCM
+    // Decrypt messages with AES-GCM (with in-memory cache for speed)
     const decryptedMessages: ChatMessage[] = [];
     for (const row of rows) {
+      const stats = replyStatsMap.get(row.id);
+
+      // Check cache first to avoid re-decryption latency
+      if (this.messageCache.has(row.id)) {
+        const cached = this.messageCache.get(row.id)!;
+        const updated = {
+          ...cached,
+          reactions: reactionsMap.get(row.id) || cached.reactions,
+          replyCount: stats?.count || cached.replyCount || 0,
+          lastReplyAt: stats?.lastReplyAt || cached.lastReplyAt,
+        };
+        this.messageCache.set(row.id, updated);
+        decryptedMessages.push(updated);
+        continue;
+      }
+
       let content = row.content;
       if (row.iv && this.cryptoKey) {
         content = await decryptWithAESGCM(row.content, row.iv, this.cryptoKey);
@@ -525,7 +608,7 @@ export class RoomDO {
         }
       }
 
-      decryptedMessages.push({
+      const chatMessage: ChatMessage = {
         id: row.id,
         roomId: row.room_id,
         senderId: row.sender_id,
@@ -533,8 +616,14 @@ export class RoomDO {
         content,
         attachment,
         reactions: reactionsMap.get(row.id),
+        parentId: row.parent_id || undefined,
+        replyCount: stats?.count || 0,
+        lastReplyAt: stats?.lastReplyAt,
         createdAt: row.created_at,
-      });
+      };
+
+      this.messageCache.set(row.id, chatMessage);
+      decryptedMessages.push(chatMessage);
     }
 
     return decryptedMessages;

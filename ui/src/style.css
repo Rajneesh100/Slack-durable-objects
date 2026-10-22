@@ -931,51 +931,101 @@ html, body {
 }
 
 /* ==========================================================================
-   Emoji Picker Popover
+   Enhanced Emoji Picker Popover (Wide Range & Categorized)
    ========================================================================== */
 .emoji-popover {
   position: absolute;
   bottom: 84px;
   right: 24px;
-  width: 300px;
-  background: var(--bg-popover);
+  width: 360px;
+  background: #1e1e24;
   border: 1px solid var(--border-medium);
   border-radius: var(--radius-md);
-  box-shadow: var(--shadow-popup);
-  padding: 10px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.08);
+  padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  z-index: 100;
+  gap: 10px;
+  z-index: 120;
 }
 
-.emoji-popover-header {
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--text-muted);
+.emoji-search-box {
+  width: 100%;
+}
+
+.emoji-search-input {
+  width: 100%;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--border-medium);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  font-size: 13px;
+  color: #fff;
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.emoji-search-input:focus {
+  border-color: var(--accent-blue);
+}
+
+.emoji-categories-nav {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
   padding-bottom: 4px;
   border-bottom: 1px solid var(--border-subtle);
 }
 
+.emoji-cat-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 8px;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all var(--transition-fast);
+}
+
+.emoji-cat-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
+
+.emoji-cat-btn.active {
+  background: rgba(54, 197, 240, 0.15);
+  color: #36c5f0;
+}
+
 .emoji-grid {
   display: grid;
-  grid-template-columns: repeat(7, 1fr);
+  grid-template-columns: repeat(8, 1fr);
   gap: 4px;
-  max-height: 180px;
+  max-height: 220px;
   overflow-y: auto;
+  padding-right: 4px;
 }
 
 .emoji-item-btn {
   background: transparent;
   border: none;
-  font-size: 20px;
-  height: 34px;
+  font-size: 22px;
+  height: 36px;
   display: flex;
   align-items: center;
   justify-content: center;
   border-radius: var(--radius-xs);
   cursor: pointer;
-  transition: transform var(--transition-fast);
+  transition: transform var(--transition-fast), background var(--transition-fast);
+  user-select: none;
+}
+
+.emoji-item-btn:hover {
+  background: rgba(255, 255, 255, 0.14);
+  transform: scale(1.2);
 }
 
 .emoji-item-btn:hover {
@@ -1309,5 +1359,185 @@ html, body {
 .lock-join-form input:focus {
   border-color: var(--border-focus);
 }
+
+/* ==========================================================================
+   Slack Thread Side Panel & Thread Reply Buttons
+   ========================================================================== */
+.reply-thread-action-btn {
+  background: transparent;
+  border: none;
+  font-size: 13px;
+  color: var(--text-muted);
+  height: 28px;
+  padding: 0 8px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.reply-thread-action-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+.thread-pill-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 4px 10px;
+  background: rgba(54, 197, 240, 0.08);
+  border: 1px solid rgba(54, 197, 240, 0.25);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 700;
+  color: #36c5f0;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  user-select: none;
+  width: fit-content;
+}
+
+.thread-pill-btn:hover {
+  background: rgba(54, 197, 240, 0.18);
+  border-color: #36c5f0;
+}
+
+.thread-pill-icon {
+  font-size: 13px;
+}
+
+.thread-pill-time {
+  color: var(--text-muted);
+  font-weight: 500;
+  font-size: 11px;
+}
+
+.thread-pane {
+  display: flex;
+  flex-direction: column;
+  width: 420px;
+  min-width: 340px;
+  background: var(--bg-main);
+  border-left: 1px solid var(--border-medium);
+  height: 100vh;
+  position: relative;
+  z-index: 20;
+  flex-shrink: 0;
+  animation: slideInRight 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes slideInRight {
+  from { transform: translateX(40px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+@media (max-width: 900px) {
+  .thread-pane {
+    position: fixed;
+    top: 0;
+    right: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 100;
+  }
+}
+
+.thread-header {
+  height: 64px;
+  padding: 0 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-sidebar);
+}
+
+.thread-header-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.thread-header-info h3 {
+  font-size: 16px;
+  font-weight: 800;
+  color: #fff;
+}
+
+.thread-header-info span {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.thread-close-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 20px;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.thread-close-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
+.thread-body {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.thread-root-message {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.thread-divider {
+  display: flex;
+  align-items: center;
+  padding: 14px 20px 8px;
+  gap: 12px;
+}
+
+.thread-divider-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.thread-divider-line {
+  flex: 1;
+  height: 1px;
+  background: var(--border-subtle);
+}
+
+.thread-replies-stream {
+  flex: 1;
+  padding: 8px 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.thread-composer-wrap {
+  padding: 12px 16px 16px;
+  background: var(--bg-main);
+  border-top: 1px solid var(--border-subtle);
+}
+
 
 

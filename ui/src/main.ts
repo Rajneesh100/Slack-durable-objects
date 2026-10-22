@@ -40,6 +40,9 @@ interface ChatMessage {
   readonly content: string;
   readonly attachment?: FileAttachment;
   readonly reactions?: Readonly<Record<string, readonly string[]>>; // emoji -> userIds
+  readonly parentId?: string;
+  readonly replyCount?: number;
+  readonly lastReplyAt?: number;
   readonly createdAt: number;
 }
 
@@ -64,21 +67,208 @@ interface AppState {
   readonly isConnecting: boolean;
   readonly copiedInvite: boolean;
   readonly showEmojiPicker: boolean;
+  readonly showThreadEmojiPicker: boolean;
+  readonly emojiCategory: "all" | "smileys" | "gestures" | "hearts" | "objects" | "food";
+  readonly emojiSearchQuery: string;
   readonly pendingAttachment: FileAttachment | null;
+  readonly threadPendingAttachment: FileAttachment | null;
   readonly unreadChannels: Readonly<Record<string, number>>;
   readonly alertToast: AlertToast | null;
   readonly mentionQuery: string | null;
   readonly isChannelForbidden: boolean;
+  readonly activeThreadParentId: string | null;
+  readonly threadMessages: readonly ChatMessage[];
+  readonly isThreadLoading: boolean;
+  readonly drafts: Readonly<Record<string, string>>;
 }
 
-// Common Slack Emojis
-const SLACK_EMOJIS = [
-  "👍", "👎", "❤️", "🔥", "🚀", "😂", "🎉", "👀",
-  "💯", "👏", "🙌", "😍", "🥳", "😎", "🤔", "💡",
-  "✨", "⚡", "🤝", "🙏", "✅", "❌", "💬", "📌",
-  "😀", "😃", "😄", "😁", "😆", "😅", "🤣", "😇",
-  "🙃", "😉", "😌", "🥰", "😘", "😋", "😜", "🤩",
-  "☕", "🍕", "🍔", "🍻", "💻", "📱", "🎯", "💎"
+interface EmojiDefinition {
+  readonly emoji: string;
+  readonly name: string;
+  readonly category: "smileys" | "gestures" | "hearts" | "objects" | "food";
+}
+
+const EMOJI_CATALOG: readonly EmojiDefinition[] = [
+  // Smileys & Emotions
+  { emoji: "😀", name: "grinning face smile happy", category: "smileys" },
+  { emoji: "😃", name: "smiley happy joy", category: "smileys" },
+  { emoji: "😄", name: "smile laughing happy", category: "smileys" },
+  { emoji: "😁", name: "beaming grin teeth", category: "smileys" },
+  { emoji: "😆", name: "laughing squint laugh", category: "smileys" },
+  { emoji: "😅", name: "sweat smile relief nervous", category: "smileys" },
+  { emoji: "🤣", name: "rofl rolling laughing", category: "smileys" },
+  { emoji: "😂", name: "joy tears of joy laugh lol", category: "smileys" },
+  { emoji: "🙂", name: "slight smile positive", category: "smileys" },
+  { emoji: "🙃", name: "upside down silly sarcasm", category: "smileys" },
+  { emoji: "😉", name: "wink playful flirt", category: "smileys" },
+  { emoji: "😊", name: "blush sweet happy", category: "smileys" },
+  { emoji: "😇", name: "halo angel innocent", category: "smileys" },
+  { emoji: "🥰", name: "hearts in love adored", category: "smileys" },
+  { emoji: "😍", name: "heart eyes love crush", category: "smileys" },
+  { emoji: "🤩", name: "star struck excited wow", category: "smileys" },
+  { emoji: "😘", name: "kiss blow kiss love", category: "smileys" },
+  { emoji: "😋", name: "yum delicious tongue", category: "smileys" },
+  { emoji: "😛", name: "tongue silly playful", category: "smileys" },
+  { emoji: "😜", name: "wink tongue crazy party", category: "smileys" },
+  { emoji: "🤪", name: "zany wacky wild goofy", category: "smileys" },
+  { emoji: "🤑", name: "money mouth rich cash", category: "smileys" },
+  { emoji: "🤗", name: "hug hugging warm welcome", category: "smileys" },
+  { emoji: "🤭", name: "hand over mouth giggle oops", category: "smileys" },
+  { emoji: "🤫", name: "shh quiet secret silent", category: "smileys" },
+  { emoji: "🤔", name: "thinking ponder hmm curious", category: "smileys" },
+  { emoji: "🤐", name: "zipper mouth sealed quiet", category: "smileys" },
+  { emoji: "🤨", name: "raised eyebrow skeptic suspect", category: "smileys" },
+  { emoji: "😐", name: "neutral poker face blank", category: "smileys" },
+  { emoji: "😑", name: "expressionless speechless meh", category: "smileys" },
+  { emoji: "😶", name: "no mouth blank quiet", category: "smileys" },
+  { emoji: "😏", name: "smirk smug clever", category: "smileys" },
+  { emoji: "😒", name: "unamused annoyed unbothered", category: "smileys" },
+  { emoji: "🙄", name: "roll eyes whatever sarcasm", category: "smileys" },
+  { emoji: "😬", name: "grimace awkward yikes", category: "smileys" },
+  { emoji: "🤥", name: "lying pinocchio dishonest", category: "smileys" },
+  { emoji: "😌", name: "relieved peace calm zen", category: "smileys" },
+  { emoji: "😴", name: "sleeping zzz tired goodnight", category: "smileys" },
+  { emoji: "😷", name: "mask sick flu hospital", category: "smileys" },
+  { emoji: "🤒", name: "thermometer fever ill sick", category: "smileys" },
+  { emoji: "🤢", name: "nauseated gross disgust", category: "smileys" },
+  { emoji: "🥵", name: "hot heat sweating summer", category: "smileys" },
+  { emoji: "🥶", name: "cold freezing ice winter", category: "smileys" },
+  { emoji: "🥴", name: "woozy drunk tipsy dizzy", category: "smileys" },
+  { emoji: "🤯", name: "mind blown shocked exploding", category: "smileys" },
+  { emoji: "🤠", name: "cowboy hat yeehaw sheriff", category: "smileys" },
+  { emoji: "🥳", name: "partying celebrate birthday", category: "smileys" },
+  { emoji: "😎", name: "sunglasses cool chill awesome", category: "smileys" },
+  { emoji: "🤓", name: "nerd geek glasses smart", category: "smileys" },
+  { emoji: "🧐", name: "monocle examine detective", category: "smileys" },
+  { emoji: "😕", name: "confused puzzled what", category: "smileys" },
+  { emoji: "😟", name: "worried concerned nervous", category: "smileys" },
+  { emoji: "😮", name: "surprised wow whoa gasp", category: "smileys" },
+  { emoji: "😲", name: "astonished shocked stunned", category: "smileys" },
+  { emoji: "😳", name: "flushed embarrassed shocked", category: "smileys" },
+  { emoji: "🥺", name: "pleading begging puppy eyes", category: "smileys" },
+  { emoji: "😨", name: "fearful scared frightened", category: "smileys" },
+  { emoji: "😰", name: "anxious sweat nervous cold", category: "smileys" },
+  { emoji: "😥", name: "sad but relieved whew", category: "smileys" },
+  { emoji: "😢", name: "crying tear sad upset", category: "smileys" },
+  { emoji: "😭", name: "sob crying loud bawling", category: "smileys" },
+  { emoji: "😱", name: "scream horrified fear panic", category: "smileys" },
+  { emoji: "😖", name: "confounded frustrated struggling", category: "smileys" },
+  { emoji: "😣", name: "persevering effort endure", category: "smileys" },
+  { emoji: "😞", name: "disappointed upset down", category: "smileys" },
+  { emoji: "😤", name: "triumph smoke angry proud", category: "smileys" },
+  { emoji: "😡", name: "rage pouting mad furious", category: "smileys" },
+  { emoji: "😠", name: "angry mad furious", category: "smileys" },
+  { emoji: "🤬", name: "cursing swear swearing mad", category: "smileys" },
+  { emoji: "😈", name: "devil naughty evil mischievous", category: "smileys" },
+  { emoji: "💀", name: "skull dead ded lol dying", category: "smileys" },
+  { emoji: "💩", name: "poop pile crap funny", category: "smileys" },
+  { emoji: "🤡", name: "clown foolish silly", category: "smileys" },
+  { emoji: "👻", name: "ghost spooky boo halloween", category: "smileys" },
+  { emoji: "👽", name: "alien ufo extraterrestrial", category: "smileys" },
+  { emoji: "🤖", name: "robot bot automated AI", category: "smileys" },
+
+  // Hands & Gestures
+  { emoji: "👍", name: "thumbs up approve like yes good ok", category: "gestures" },
+  { emoji: "👎", name: "thumbs down disapprove dislike no bad", category: "gestures" },
+  { emoji: "👏", name: "clap applause cheer congrats", category: "gestures" },
+  { emoji: "🙌", name: "raised hands celebrate hooray", category: "gestures" },
+  { emoji: "👐", name: "open hands welcoming jazz", category: "gestures" },
+  { emoji: "🤲", name: "palms together praying offer", category: "gestures" },
+  { emoji: "🤝", name: "handshake deal agreement partner", category: "gestures" },
+  { emoji: "🙏", name: "folded hands please pray thank you namaste", category: "gestures" },
+  { emoji: "✍️", name: "writing hand pen notes memo", category: "gestures" },
+  { emoji: "💪", name: "flex biceps strong muscle gym power", category: "gestures" },
+  { emoji: "👀", name: "eyes looking look glance curious watch", category: "gestures" },
+  { emoji: "✌️", name: "peace victory two v sign", category: "gestures" },
+  { emoji: "🤞", name: "fingers crossed luck hope", category: "gestures" },
+  { emoji: "🤟", name: "love you gesture sign", category: "gestures" },
+  { emoji: "🤘", name: "rock on horns heavy metal", category: "gestures" },
+  { emoji: "🤙", name: "call me shaka phone hang loose", category: "gestures" },
+  { emoji: "🖐️", name: "hand splayed five high five", category: "gestures" },
+  { emoji: "✋", name: "raised hand stop high five wait", category: "gestures" },
+  { emoji: "👌", name: "ok hand perfect fine nice", category: "gestures" },
+  { emoji: "🤌", name: "pinched fingers italian chef kiss what", category: "gestures" },
+  { emoji: "🤏", name: "pinching hand tiny small little", category: "gestures" },
+  { emoji: "👈", name: "point left direction", category: "gestures" },
+  { emoji: "👉", name: "point right direction", category: "gestures" },
+  { emoji: "👆", name: "point up above this", category: "gestures" },
+  { emoji: "👇", name: "point down below this", category: "gestures" },
+  { emoji: "☝️", name: "index finger pointing up idea attention", category: "gestures" },
+  { emoji: "👋", name: "wave hello goodbye hi bye", category: "gestures" },
+  { emoji: "🫡", name: "saluting face respect yes sir copy", category: "gestures" },
+
+  // Hearts & Reactions
+  { emoji: "❤️", name: "red heart love favorite like", category: "hearts" },
+  { emoji: "🧡", name: "orange heart warm love", category: "hearts" },
+  { emoji: "💛", name: "yellow heart friendly love", category: "hearts" },
+  { emoji: "💚", name: "green heart nature envy love", category: "hearts" },
+  { emoji: "💙", name: "blue heart loyalty calm love", category: "hearts" },
+  { emoji: "💜", name: "purple heart royalty love", category: "hearts" },
+  { emoji: "🖤", name: "black heart dark gothic emo", category: "hearts" },
+  { emoji: "🤍", name: "white heart pure clean peace", category: "hearts" },
+  { emoji: "🤎", name: "brown heart chocolate earth", category: "hearts" },
+  { emoji: "💔", name: "broken heart sad breakup hurt", category: "hearts" },
+  { emoji: "❤️‍🔥", name: "heart on fire passion burning", category: "hearts" },
+  { emoji: "💖", name: "sparkling heart sparkle shine", category: "hearts" },
+  { emoji: "💗", name: "growing heart excitement pulse", category: "hearts" },
+  { emoji: "💓", name: "beating heart heartbeat", category: "hearts" },
+  { emoji: "💞", name: "revolving hearts romance", category: "hearts" },
+  { emoji: "💕", name: "two hearts love sweet", category: "hearts" },
+  { emoji: "🔥", name: "fire lit hot amazing lit hype", category: "hearts" },
+  { emoji: "⭐", name: "star fav rating favorite", category: "hearts" },
+  { emoji: "🌟", name: "glowing star shine bright", category: "hearts" },
+  { emoji: "✨", name: "sparkles shiny clean magic new", category: "hearts" },
+  { emoji: "⚡", name: "zap lightning bolt fast quick energy", category: "hearts" },
+  { emoji: "💥", name: "collision boom explosion blast", category: "hearts" },
+  { emoji: "💯", name: "hundred points perfect score 100 legit", category: "hearts" },
+  { emoji: "💢", name: "anger sign anime mad comic", category: "hearts" },
+  { emoji: "💫", name: "dizzy star spark swirl", category: "hearts" },
+  { emoji: "💬", name: "speech balloon chat message comment", category: "hearts" },
+  { emoji: "✅", name: "check mark done success correct finished", category: "hearts" },
+  { emoji: "❌", name: "cross mark wrong error fail cancelled", category: "hearts" },
+  { emoji: "⚠️", name: "warning alert caution hazard", category: "hearts" },
+  { emoji: "📌", name: "pushpin pin pinned important save", category: "hearts" },
+
+  // Activities & Objects
+  { emoji: "🚀", name: "rocket ship launch speed fast deploy ship it", category: "objects" },
+  { emoji: "🎉", name: "party popper celebration tada congrats yay", category: "objects" },
+  { emoji: "🎊", name: "confetti ball party celebrate", category: "objects" },
+  { emoji: "🏆", name: "trophy win winner champion award gold", category: "objects" },
+  { emoji: "🥇", name: "1st place medal gold first winner", category: "objects" },
+  { emoji: "🎯", name: "bullseye target goal hit direct accurate", category: "objects" },
+  { emoji: "💻", name: "laptop computer tech code work developer", category: "objects" },
+  { emoji: "📱", name: "mobile phone smartphone tech screen", category: "objects" },
+  { emoji: "💡", name: "light bulb idea smart tip suggestion", category: "objects" },
+  { emoji: "🔑", name: "key unlock password secret access", category: "objects" },
+  { emoji: "🔒", name: "lock secure encrypted private safe", category: "objects" },
+  { emoji: "💎", name: "gem stone diamond premium value shiny", category: "objects" },
+  { emoji: "🔔", name: "bell notification alert reminder ring", category: "objects" },
+  { emoji: "📦", name: "package box parcel delivery ship", category: "objects" },
+  { emoji: "🛠️", name: "hammer and wrench tools fix repair build", category: "objects" },
+  { emoji: "⚙️", name: "gear cog settings config options", category: "objects" },
+  { emoji: "📊", name: "bar chart stats metrics graph analytics", category: "objects" },
+  { emoji: "📈", name: "chart increasing growth up stonks profit", category: "objects" },
+  { emoji: "📝", name: "memo note document write edit draft", category: "objects" },
+  { emoji: "📄", name: "page document file sheet text", category: "objects" },
+  { emoji: "📁", name: "file folder directory documents", category: "objects" },
+  { emoji: "🔗", name: "link url hyperlink connect anchor", category: "objects" },
+  { emoji: "✂️", name: "scissors cut trim snippet", category: "objects" },
+  { emoji: "☕", name: "hot beverage coffee tea morning break", category: "food" },
+  { emoji: "🍕", name: "pizza slice cheese food party lunch", category: "food" },
+  { emoji: "🍔", name: "hamburger burger fast food dinner", category: "food" },
+  { emoji: "🍟", name: "french fries potato chips snack", category: "food" },
+  { emoji: "🌭", name: "hot dog sausage snack", category: "food" },
+  { emoji: "🍿", name: "popcorn movie theater snack film", category: "food" },
+  { emoji: "🍩", name: "doughnut donut sweet pastry glaze", category: "food" },
+  { emoji: "🍪", name: "cookie biscuit sweet chocolate snack", category: "food" },
+  { emoji: "🎂", name: "birthday cake celebration sweet dessert", category: "food" },
+  { emoji: "🍻", name: "clinking beer mugs cheers drinks party bar", category: "food" },
+  { emoji: "🥂", name: "clinking glasses champagne toast cheers celebration", category: "food" },
+  { emoji: "🍷", name: "wine glass red alcohol drink", category: "food" },
+  { emoji: "🍣", name: "sushi japanese seafood rice dinner", category: "food" },
+  { emoji: "🌮", name: "taco mexican food lunch dinner", category: "food" },
+  { emoji: "🍎", name: "red apple fruit healthy fresh teacher", category: "food" },
+  { emoji: "🥑", name: "avocado healthy fresh guac keto", category: "food" },
 ];
 
 const QUICK_REACTIONS = ["👍", "❤️", "🔥", "😂", "🚀", "👀"];
@@ -138,6 +328,19 @@ const clearPersistedAuth = (): void => {
   localStorage.removeItem("dc_user");
 };
 
+const formatRelativeTime = (timestamp: number): string => {
+  const diff = Date.now() - timestamp;
+  const minutes = Math.floor(diff / 60000);
+  if (minutes < 1) return "just now";
+  if (minutes === 1) return "1 min ago";
+  if (minutes < 60) return `${minutes} mins ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours === 1) return "1 hr ago";
+  if (hours < 24) return `${hours} hrs ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+};
+
 // Initial State
 const initialAuth = loadPersistedAuth();
 
@@ -159,11 +362,19 @@ let state: AppState = {
   isConnecting: false,
   copiedInvite: false,
   showEmojiPicker: false,
+  showThreadEmojiPicker: false,
+  emojiCategory: "all",
+  emojiSearchQuery: "",
   pendingAttachment: null,
+  threadPendingAttachment: null,
   unreadChannels: {},
   alertToast: null,
   mentionQuery: null,
   isChannelForbidden: false,
+  activeThreadParentId: null,
+  threadMessages: [],
+  isThreadLoading: false,
+  drafts: {},
 };
 
 let activeSocket: WebSocket | null = null;
@@ -171,10 +382,42 @@ let typingDebounceTimer: number | null = null;
 let toastTimeout: number | null = null;
 let lastTypingSent = 0;
 
-// Update state and trigger re-render
+// Update state and trigger re-render while NEVER losing user's typed drafts
 const updateState = (updater: (prev: AppState) => AppState): void => {
-  state = updater(state);
+  const mainInput = document.getElementById("chat-input") as HTMLTextAreaElement | null;
+  const threadInput = document.getElementById("thread-chat-input") as HTMLTextAreaElement | null;
+
+  const currentDrafts = { ...state.drafts };
+  if (mainInput && state.activeChannelId) {
+    currentDrafts[state.activeChannelId] = mainInput.value;
+  }
+  if (threadInput && state.activeThreadParentId) {
+    currentDrafts[`thread:${state.activeThreadParentId}`] = threadInput.value;
+  }
+
+  // Preserve focus and selection
+  const activeEl = document.activeElement;
+  const focusedId = activeEl?.id;
+  let cursorStart = 0;
+  let cursorEnd = 0;
+  if (activeEl instanceof HTMLTextAreaElement || activeEl instanceof HTMLInputElement) {
+    cursorStart = activeEl.selectionStart || 0;
+    cursorEnd = activeEl.selectionEnd || 0;
+  }
+
+  state = updater({ ...state, drafts: currentDrafts });
   renderApp();
+
+  // Restore focus and cursor seamlessly
+  if (focusedId) {
+    const el = document.getElementById(focusedId);
+    if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
+      el.focus();
+      try {
+        el.setSelectionRange(cursorStart, cursorEnd);
+      } catch {}
+    }
+  }
 };
 
 const showSlackAlertToast = (title: string, snippet: string, channelId: string): void => {
@@ -266,11 +509,43 @@ const connectWebSocket = (channelId: string, token: string): void => {
           }
 
           if (isCurrentRoom) {
-            updateState((s) => ({
-              ...s,
-              messages: [...s.messages, msg],
-            }));
-            scrollChatToBottom();
+            if (msg.parentId) {
+              // Thread reply: update active thread and increment parent's replyCount
+              updateState((s) => {
+                const isMatchingActiveThread = s.activeThreadParentId === msg.parentId;
+                const nextThreadMessages = isMatchingActiveThread
+                  ? [...s.threadMessages, msg]
+                  : s.threadMessages;
+
+                const nextMessages = s.messages.map((m) => {
+                  if (m.id === msg.parentId) {
+                    return {
+                      ...m,
+                      replyCount: (m.replyCount || 0) + 1,
+                      lastReplyAt: msg.createdAt,
+                    };
+                  }
+                  return m;
+                });
+
+                return {
+                  ...s,
+                  messages: nextMessages,
+                  threadMessages: nextThreadMessages,
+                };
+              });
+
+              if (state.activeThreadParentId === msg.parentId) {
+                scrollThreadToBottom();
+              }
+            } else {
+              // Top-level channel message
+              updateState((s) => ({
+                ...s,
+                messages: [...s.messages, msg],
+              }));
+              scrollChatToBottom();
+            }
           } else {
             // Unread indicator for other channels
             updateState((s) => ({
@@ -286,17 +561,23 @@ const connectWebSocket = (channelId: string, token: string): void => {
 
         case "REACTION_UPDATED": {
           updateState((s) => {
-            const nextMessages = s.messages.map((m) => {
-              if (m.id !== data.messageId) return m;
-              const currentReactions = { ...(m.reactions || {}) };
-              if (data.userIds && data.userIds.length > 0) {
-                currentReactions[data.emoji] = data.userIds;
-              } else {
-                delete currentReactions[data.emoji];
-              }
-              return { ...m, reactions: currentReactions };
-            });
-            return { ...s, messages: nextMessages };
+            const updateList = (list: readonly ChatMessage[]) =>
+              list.map((m) => {
+                if (m.id !== data.messageId) return m;
+                const currentReactions = { ...(m.reactions || {}) };
+                if (data.userIds && data.userIds.length > 0) {
+                  currentReactions[data.emoji] = data.userIds;
+                } else {
+                  delete currentReactions[data.emoji];
+                }
+                return { ...m, reactions: currentReactions };
+              });
+
+            return {
+              ...s,
+              messages: updateList(s.messages),
+              threadMessages: updateList(s.threadMessages),
+            };
           });
           break;
         }
@@ -355,39 +636,149 @@ const connectWebSocket = (channelId: string, token: string): void => {
   };
 };
 
-const sendChatMessage = (content: string): void => {
+const sendChatMessage = (content: string, parentId?: string): void => {
   if (!activeSocket || activeSocket.readyState !== WebSocket.OPEN) return;
   const trimmed = content.trim();
-  if (trimmed.length === 0 && !state.pendingAttachment) return;
+  const attachment = parentId ? state.threadPendingAttachment : state.pendingAttachment;
+  if (trimmed.length === 0 && !attachment) return;
 
   activeSocket.send(
     JSON.stringify({
       type: "SEND_MESSAGE",
       content: trimmed,
-      attachment: state.pendingAttachment || undefined,
+      attachment: attachment || undefined,
+      parentId,
     })
   );
 
-  updateState((s) => ({
-    ...s,
-    pendingAttachment: null,
-    showEmojiPicker: false,
-    mentionQuery: null,
-  }));
-  sendTypingSignal(false);
+  if (parentId) {
+    const nextDrafts = { ...state.drafts };
+    delete nextDrafts[`thread:${parentId}`];
+    updateState((s) => ({
+      ...s,
+      drafts: nextDrafts,
+      threadPendingAttachment: null,
+      showThreadEmojiPicker: false,
+    }));
+  } else {
+    const nextDrafts = { ...state.drafts };
+    delete nextDrafts[state.activeChannelId];
+    updateState((s) => ({
+      ...s,
+      drafts: nextDrafts,
+      pendingAttachment: null,
+      showEmojiPicker: false,
+      mentionQuery: null,
+    }));
+    sendTypingSignal(false);
+  }
 };
 
 const submitCurrentMessage = (): void => {
   const chatInput = document.getElementById("chat-input") as HTMLTextAreaElement | null;
-  if (!chatInput) return;
-  const content = chatInput.value;
+  const content = chatInput ? chatInput.value : (state.drafts[state.activeChannelId] || "");
 
   if (content.trim().length === 0 && !state.pendingAttachment) return;
 
   sendChatMessage(content);
-  chatInput.value = "";
-  chatInput.style.height = "auto";
-  chatInput.focus();
+  if (chatInput) {
+    chatInput.value = "";
+    chatInput.style.height = "auto";
+    chatInput.focus();
+  }
+};
+
+const submitThreadMessage = (): void => {
+  if (!state.activeThreadParentId) return;
+  const threadInput = document.getElementById("thread-chat-input") as HTMLTextAreaElement | null;
+  const content = threadInput ? threadInput.value : (state.drafts[`thread:${state.activeThreadParentId}`] || "");
+
+  if (content.trim().length === 0 && !state.threadPendingAttachment) return;
+
+  sendChatMessage(content, state.activeThreadParentId);
+  if (threadInput) {
+    threadInput.value = "";
+    threadInput.style.height = "auto";
+    threadInput.focus();
+  }
+};
+
+const openThread = async (messageId: string): Promise<void> => {
+  updateState((s) => ({
+    ...s,
+    activeThreadParentId: messageId,
+    threadMessages: [],
+    isThreadLoading: true,
+    showEmojiPicker: false,
+    showThreadEmojiPicker: false,
+  }));
+
+  try {
+    const res = await fetch(
+      `/api/channels/${encodeURIComponent(state.activeChannelId)}/messages?token=${encodeURIComponent(state.token || "")}&parentId=${encodeURIComponent(messageId)}`
+    );
+    if (res.ok) {
+      const data = await res.json();
+      updateState((s) => ({
+        ...s,
+        threadMessages: data.messages || [],
+        isThreadLoading: false,
+      }));
+      scrollThreadToBottom();
+    } else {
+      updateState((s) => ({ ...s, isThreadLoading: false }));
+    }
+  } catch (err) {
+    console.error("Failed to load thread messages:", err);
+    updateState((s) => ({ ...s, isThreadLoading: false }));
+  }
+};
+
+const closeThread = (): void => {
+  updateState((s) => ({
+    ...s,
+    activeThreadParentId: null,
+    threadMessages: [],
+    showThreadEmojiPicker: false,
+    threadPendingAttachment: null,
+  }));
+};
+
+const scrollThreadToBottom = (): void => {
+  requestAnimationFrame(() => {
+    const threadStream = document.getElementById("thread-messages-stream");
+    if (threadStream) {
+      threadStream.scrollTop = threadStream.scrollHeight;
+    }
+  });
+};
+
+const insertEmojiIntoInput = (emoji: string, target: "main" | "thread"): void => {
+  const inputId = target === "main" ? "chat-input" : "thread-chat-input";
+  const input = document.getElementById(inputId) as HTMLTextAreaElement | null;
+  const draftKey = target === "main" ? state.activeChannelId : `thread:${state.activeThreadParentId}`;
+
+  const currentVal = input ? input.value : state.drafts[draftKey] || "";
+  const start = input ? input.selectionStart : currentVal.length;
+  const end = input ? input.selectionEnd : currentVal.length;
+
+  const nextVal = currentVal.substring(0, start) + emoji + currentVal.substring(end);
+  const nextPos = start + emoji.length;
+
+  // Update in drafts
+  state = {
+    ...state,
+    drafts: {
+      ...state.drafts,
+      [draftKey]: nextVal,
+    },
+  };
+
+  if (input) {
+    input.value = nextVal;
+    input.selectionStart = input.selectionEnd = nextPos;
+    input.focus();
+  }
 };
 
 const toggleMessageReaction = (messageId: string, emoji: string): void => {
@@ -790,6 +1181,29 @@ const handleFileUpload = (file: File): void => {
   reader.readAsDataURL(file);
 };
 
+const handleThreadFileUpload = (file: File): void => {
+  if (file.size > 8 * 1024 * 1024) {
+    alert("File is too large. Maximum size is 8MB.");
+    return;
+  }
+
+  const reader = new FileReader();
+  reader.onload = () => {
+    const dataUrl = reader.result as string;
+    const attachment: FileAttachment = {
+      name: file.name,
+      type: file.type || "application/octet-stream",
+      size: file.size,
+      dataUrl,
+    };
+    updateState((s) => ({ ...s, threadPendingAttachment: attachment }));
+
+    const threadInput = document.getElementById("thread-chat-input") as HTMLTextAreaElement | null;
+    if (threadInput) threadInput.focus();
+  };
+  reader.readAsDataURL(file);
+};
+
 // ==========================================================================
 // View Renderers
 // ==========================================================================
@@ -886,7 +1300,81 @@ const renderAttachment = (att: FileAttachment): string => {
   `;
 };
 
-const renderMessage = (msg: ChatMessage): string => {
+const renderEmojiPopover = (target: "main" | "thread"): string => {
+  const categories: readonly { readonly id: AppState["emojiCategory"]; readonly label: string }[] = [
+    { id: "all", label: "All" },
+    { id: "smileys", label: "Smileys" },
+    { id: "gestures", label: "Hands" },
+    { id: "hearts", label: "Hearts" },
+    { id: "objects", label: "Things" },
+    { id: "food", label: "Food" },
+  ];
+
+  const search = state.emojiSearchQuery.toLowerCase().trim();
+  const filtered = EMOJI_CATALOG.filter((e) => {
+    const matchCat = state.emojiCategory === "all" || e.category === state.emojiCategory;
+    const matchSearch = !search || e.name.toLowerCase().includes(search) || e.emoji === search;
+    return matchCat && matchSearch;
+  });
+
+  const searchInputId = target === "main" ? "emoji-search-input" : "thread-emoji-search-input";
+  const popoverId = target === "main" ? "emoji-popover" : "thread-emoji-popover";
+
+  return `
+    <div class="emoji-popover" id="${popoverId}">
+      <div class="emoji-popover-header">
+        <input
+          type="text"
+          id="${searchInputId}"
+          class="emoji-search-box"
+          placeholder="Search 140+ emojis..."
+          value="${escapeHtml(state.emojiSearchQuery)}"
+          autocomplete="off"
+        />
+      </div>
+
+      <div class="emoji-category-bar">
+        ${categories
+          .map(
+            (c) => `
+          <button
+            type="button"
+            class="emoji-cat-btn ${state.emojiCategory === c.id ? "active" : ""}"
+            data-category="${c.id}"
+          >
+            ${c.label}
+          </button>
+        `
+          )
+          .join("")}
+      </div>
+
+      <div class="emoji-grid">
+        ${
+          filtered.length === 0
+            ? `<div class="emoji-empty-msg">No matching emojis</div>`
+            : filtered
+                .map(
+                  (e) => `
+                <button
+                  type="button"
+                  class="emoji-item-btn"
+                  data-target="${target}"
+                  data-insert-emoji="${e.emoji}"
+                  title="${escapeHtml(e.name)}"
+                >
+                  ${e.emoji}
+                </button>
+              `
+                )
+                .join("")
+        }
+      </div>
+    </div>
+  `;
+};
+
+const renderMessage = (msg: ChatMessage, isThreadView = false): string => {
   const avatarBg = getAvatarGradient(msg.senderName);
   const initials = getInitials(msg.senderName);
   const reactions = msg.reactions || {};
@@ -908,6 +1396,15 @@ const renderMessage = (msg: ChatMessage): string => {
           </button>
         `
         ).join("")}
+        ${
+          !isThreadView
+            ? `
+          <button type="button" class="reply-thread-action-btn" data-thread-msg-id="${msg.id}" title="Reply in thread">
+            <svg style="width:14px;height:14px;fill:currentColor" viewBox="0 0 24 24"><path d="M21 6h-2v9H6v2c0 .55.45 1 1 1h11l4 4V7c0-.55-.45-1-1-1zm-4 6V3c0-.55-.45-1-1-1H3c-.55 0-1 .45-1 1v14l4-4h10c.55 0 1-.45 1-1z"/></svg>
+          </button>
+        `
+            : ""
+        }
       </div>
 
       <div class="message-avatar" style="background: ${avatarBg};">
@@ -947,8 +1444,107 @@ const renderMessage = (msg: ChatMessage): string => {
           `
             : ""
         }
+
+        <!-- Slack Thread Reply Pill (Only on top-level message) -->
+        ${
+          !isThreadView && msg.replyCount && msg.replyCount > 0
+            ? `
+            <button type="button" class="thread-pill-btn" data-thread-msg-id="${msg.id}">
+              <svg style="width:14px;height:14px;fill:currentColor" viewBox="0 0 24 24"><path d="M21 6h-2v9H6v2c0 .55.45 1 1 1h11l4 4V7c0-.55-.45-1-1-1zm-4 6V3c0-.55-.45-1-1-1H3c-.55 0-1 .45-1 1v14l4-4h10c.55 0 1-.45 1-1z"/></svg>
+              <span class="thread-pill-count">${msg.replyCount} ${msg.replyCount === 1 ? "reply" : "replies"}</span>
+              ${msg.lastReplyAt ? `<span class="thread-pill-time">Last reply ${formatRelativeTime(msg.lastReplyAt)}</span>` : ""}
+            </button>
+          `
+            : ""
+        }
       </div>
     </div>
+  `;
+};
+
+const renderThreadPanel = (): string => {
+  if (!state.activeThreadParentId) return "";
+  const rootMsg = state.messages.find((m) => m.id === state.activeThreadParentId);
+  const currentChannel = state.channels.find((c) => c.id === state.activeChannelId);
+
+  return `
+    <aside class="thread-pane" id="thread-pane">
+      <div class="thread-header">
+        <div class="thread-header-title">
+          <h3>Thread</h3>
+          <span class="thread-sub-badge">#${escapeHtml(currentChannel?.name || state.activeChannelId)}</span>
+        </div>
+        <button type="button" id="thread-close-btn" class="thread-close-btn" title="Close thread">&times;</button>
+      </div>
+
+      <div class="thread-replies-stream" id="thread-messages-stream">
+        ${
+          rootMsg
+            ? `
+          <div class="thread-root-card">
+            ${renderMessage(rootMsg, true)}
+          </div>
+          <div class="thread-divider">
+            <span>${state.threadMessages.length} ${state.threadMessages.length === 1 ? "reply" : "replies"}</span>
+          </div>
+        `
+            : ""
+        }
+
+        ${
+          state.isThreadLoading
+            ? `<div class="thread-loading">Loading thread messages...</div>`
+            : state.threadMessages.map((m) => renderMessage(m, true)).join("")
+        }
+      </div>
+
+      <!-- Thread Composer -->
+      <div class="thread-composer-wrap">
+        <form id="thread-chat-form" class="composer-box">
+          ${
+            state.threadPendingAttachment
+              ? `
+            <div class="composer-attachment-preview">
+              ${
+                state.threadPendingAttachment.type.startsWith("image/")
+                  ? `<img src="${state.threadPendingAttachment.dataUrl}" class="composer-attachment-thumb" />`
+                  : `<span>📄</span>`
+              }
+              <span class="composer-attachment-name">${escapeHtml(state.threadPendingAttachment.name)} (${formatFileSize(state.threadPendingAttachment.size)})</span>
+              <button type="button" id="thread-remove-attachment-btn" class="composer-attachment-remove" title="Remove">&times;</button>
+            </div>
+          `
+              : ""
+          }
+
+          <textarea
+            id="thread-chat-input"
+            class="composer-textarea"
+            placeholder="Reply in thread... (Shift+Enter for new line)"
+            rows="1"
+          >${escapeHtml(state.drafts[`thread:${state.activeThreadParentId}`] || "")}</textarea>
+
+          <div class="composer-toolbar">
+            <div class="toolbar-group">
+              <input type="file" id="thread-file-input" style="display:none;" />
+              <button type="button" id="thread-attach-file-btn" class="toolbar-btn" title="Attach file or image">
+                <svg style="width:16px;height:16px;fill:currentColor" viewBox="0 0 24 24"><path d="M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5c0-1.38 1.12-2.5 2.5-2.5s2.5 1.12 2.5 2.5v10.5c0 .55-.45 1-1 1s-1-.45-1-1V6H10v9.5c0 1.38 1.12 2.5 2.5 2.5s2.5-1.12 2.5-2.5V5c0-2.21-1.79-4-4-4S7 2.79 7 5v12.5c0 3.04 2.46 5.5 5.5 5.5s5.5-2.46 5.5-5.5V6h-1.5z"/></svg>
+              </button>
+              <button type="button" id="thread-toggle-emoji-btn" class="toolbar-btn" title="Add emoji">
+                😊
+              </button>
+            </div>
+            <div class="toolbar-group">
+              <button type="submit" id="thread-send-btn" class="send-btn" title="Reply (Enter)">
+                <svg style="width:14px;height:14px;fill:currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+              </button>
+            </div>
+          </div>
+        </form>
+
+        ${state.showThreadEmojiPicker ? renderEmojiPopover("thread") : ""}
+      </div>
+    </aside>
   `;
 };
 
@@ -1132,7 +1728,7 @@ const renderSlackApp = (): string => {
                     <p>This room runs in an isolated Cloudflare Durable Object with SQLite. Share messages, upload files, or react with emojis!</p>
                   </div>
                 `
-                  : state.messages.map(renderMessage).join("")
+                  : state.messages.map((m) => renderMessage(m, false)).join("")
               }
             </div>
 
@@ -1190,7 +1786,7 @@ const renderSlackApp = (): string => {
                   class="composer-textarea"
                   placeholder="Message #${escapeHtml(currentChannel.name)} (Type @ to mention)"
                   rows="1"
-                ></textarea>
+                >${escapeHtml(state.drafts[state.activeChannelId] || "")}</textarea>
 
                 <div class="composer-toolbar">
                   <div class="toolbar-group">
@@ -1215,26 +1811,14 @@ const renderSlackApp = (): string => {
               </form>
 
               <!-- Emoji Popover -->
-              ${
-                state.showEmojiPicker
-                  ? `
-                  <div class="emoji-popover" id="emoji-popover">
-                    <div class="emoji-popover-header">Frequently Used Emojis</div>
-                    <div class="emoji-grid">
-                      ${SLACK_EMOJIS.map(
-                        (e) => `
-                        <button type="button" class="emoji-item-btn" data-insert-emoji="${e}">${e}</button>
-                      `
-                      ).join("")}
-                    </div>
-                  </div>
-                `
-                  : ""
-              }
+              ${state.showEmojiPicker ? renderEmojiPopover("main") : ""}
             </div>
           `
         }
       </section>
+
+      <!-- Slack Thread Side Panel (if open) -->
+      ${state.activeThreadParentId ? renderThreadPanel() : ""}
     </div>
 
     <!-- Modals -->
@@ -1458,28 +2042,139 @@ const bindEvents = (): void => {
     };
   });
 
-  // Emoji Popover Toggle
+  // Reply in Thread Button on Top-Level Messages
+  const replyThreadBtns = document.querySelectorAll<HTMLElement>(".reply-thread-action-btn");
+  replyThreadBtns.forEach((btn) => {
+    btn.onclick = () => {
+      const msgId = btn.getAttribute("data-thread-msg-id");
+      if (msgId) openThread(msgId);
+    };
+  });
+
+  // Thread Reply Count Pill on Top-Level Messages
+  const threadPillBtns = document.querySelectorAll<HTMLElement>(".thread-pill-btn");
+  threadPillBtns.forEach((btn) => {
+    btn.onclick = () => {
+      const msgId = btn.getAttribute("data-thread-msg-id");
+      if (msgId) openThread(msgId);
+    };
+  });
+
+  // Thread Side Panel Controls
+  const threadCloseBtn = document.getElementById("thread-close-btn");
+  if (threadCloseBtn) threadCloseBtn.onclick = closeThread;
+
+  const threadChatForm = document.getElementById("thread-chat-form");
+  const threadChatInput = document.getElementById("thread-chat-input") as HTMLTextAreaElement | null;
+
+  if (threadChatForm && threadChatInput) {
+    threadChatForm.onsubmit = (e) => {
+      e.preventDefault();
+      submitThreadMessage();
+    };
+
+    threadChatInput.onkeydown = (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        submitThreadMessage();
+      }
+    };
+
+    threadChatInput.oninput = () => {
+      threadChatInput.style.height = "auto";
+      threadChatInput.style.height = Math.min(threadChatInput.scrollHeight, 140) + "px";
+      if (state.activeThreadParentId) {
+        state = {
+          ...state,
+          drafts: {
+            ...state.drafts,
+            [`thread:${state.activeThreadParentId}`]: threadChatInput.value,
+          },
+        };
+      }
+    };
+  }
+
+  // Thread Emoji Toggle
+  const threadToggleEmojiBtn = document.getElementById("thread-toggle-emoji-btn");
+  if (threadToggleEmojiBtn) {
+    threadToggleEmojiBtn.onclick = (e) => {
+      e.stopPropagation();
+      updateState((s) => ({
+        ...s,
+        showThreadEmojiPicker: !s.showThreadEmojiPicker,
+        showEmojiPicker: false,
+      }));
+    };
+  }
+
+  // Thread File Upload Attachment
+  const threadAttachFileBtn = document.getElementById("thread-attach-file-btn");
+  const threadFileInput = document.getElementById("thread-file-input") as HTMLInputElement | null;
+  if (threadAttachFileBtn && threadFileInput) {
+    threadAttachFileBtn.onclick = () => threadFileInput.click();
+    threadFileInput.onchange = () => {
+      const file = threadFileInput.files?.[0];
+      if (file) handleThreadFileUpload(file);
+      threadFileInput.value = "";
+    };
+  }
+
+  // Thread Remove Pending Attachment
+  const threadRemoveAttBtn = document.getElementById("thread-remove-attachment-btn");
+  if (threadRemoveAttBtn) {
+    threadRemoveAttBtn.onclick = () => updateState((s) => ({ ...s, threadPendingAttachment: null }));
+  }
+
+  // Emoji Popover Toggle (Main Composer)
   const toggleEmojiBtn = document.getElementById("toggle-emoji-btn");
   if (toggleEmojiBtn) {
     toggleEmojiBtn.onclick = (e) => {
       e.stopPropagation();
-      updateState((s) => ({ ...s, showEmojiPicker: !s.showEmojiPicker }));
+      updateState((s) => ({
+        ...s,
+        showEmojiPicker: !s.showEmojiPicker,
+        showThreadEmojiPicker: false,
+      }));
     };
   }
 
-  // Insert Emoji into input
+  // Emoji Category Navigation Tabs
+  const emojiCatBtns = document.querySelectorAll<HTMLElement>(".emoji-cat-btn");
+  emojiCatBtns.forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const cat = btn.getAttribute("data-category") as AppState["emojiCategory"];
+      if (cat) updateState((s) => ({ ...s, emojiCategory: cat }));
+    };
+  });
+
+  // Emoji Search Input Fields
+  const emojiSearchInput = document.getElementById("emoji-search-input") as HTMLInputElement | null;
+  if (emojiSearchInput) {
+    emojiSearchInput.onclick = (e) => e.stopPropagation();
+    emojiSearchInput.oninput = () => {
+      updateState((s) => ({ ...s, emojiSearchQuery: emojiSearchInput.value }));
+    };
+  }
+
+  const threadEmojiSearchInput = document.getElementById("thread-emoji-search-input") as HTMLInputElement | null;
+  if (threadEmojiSearchInput) {
+    threadEmojiSearchInput.onclick = (e) => e.stopPropagation();
+    threadEmojiSearchInput.oninput = () => {
+      updateState((s) => ({ ...s, emojiSearchQuery: threadEmojiSearchInput.value }));
+    };
+  }
+
+  // Insert Emoji into Main or Thread Input
   const emojiItems = document.querySelectorAll<HTMLElement>(".emoji-item-btn");
   emojiItems.forEach((btn) => {
-    btn.onclick = () => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
       const emoji = btn.getAttribute("data-insert-emoji");
-      const chatInput = document.getElementById("chat-input") as HTMLTextAreaElement | null;
-      if (emoji && chatInput) {
-        const start = chatInput.selectionStart;
-        const end = chatInput.selectionEnd;
-        const val = chatInput.value;
-        chatInput.value = val.substring(0, start) + emoji + val.substring(end);
-        chatInput.selectionStart = chatInput.selectionEnd = start + emoji.length;
-        chatInput.focus();
+      const target = (btn.getAttribute("data-target") as "main" | "thread") || "main";
+      if (emoji) {
+        insertEmojiIntoInput(emoji, target);
       }
     };
   });
@@ -1504,16 +2199,26 @@ const bindEvents = (): void => {
     };
   });
 
-  // Close emoji popover when clicking outside
+  // Close emoji popovers safely when clicking outside without losing any typed text
   document.onclick = (e) => {
-    const popover = document.getElementById("emoji-popover");
-    const toggleBtn = document.getElementById("toggle-emoji-btn");
-    if (state.showEmojiPicker && popover && !popover.contains(e.target as Node) && e.target !== toggleBtn) {
+    const targetNode = e.target as Node;
+    const mainPopover = document.getElementById("emoji-popover");
+    const mainToggle = document.getElementById("toggle-emoji-btn");
+    const threadPopover = document.getElementById("thread-emoji-popover");
+    const threadToggle = document.getElementById("thread-toggle-emoji-btn");
+
+    const clickedMain = (mainPopover && mainPopover.contains(targetNode)) || (mainToggle && mainToggle.contains(targetNode));
+    const clickedThread = (threadPopover && threadPopover.contains(targetNode)) || (threadToggle && threadToggle.contains(targetNode));
+
+    if (state.showEmojiPicker && !clickedMain) {
       updateState((s) => ({ ...s, showEmojiPicker: false }));
+    }
+    if (state.showThreadEmojiPicker && !clickedThread) {
+      updateState((s) => ({ ...s, showThreadEmojiPicker: false }));
     }
   };
 
-  // File Upload Attachment
+  // File Upload Attachment (Main Composer)
   const attachFileBtn = document.getElementById("attach-file-btn");
   const fileInput = document.getElementById("file-input") as HTMLInputElement | null;
 
@@ -1564,6 +2269,16 @@ const bindEvents = (): void => {
     chatInput.oninput = () => {
       chatInput.style.height = "auto";
       chatInput.style.height = Math.min(chatInput.scrollHeight, 140) + "px";
+
+      if (state.activeChannelId) {
+        state = {
+          ...state,
+          drafts: {
+            ...state.drafts,
+            [state.activeChannelId]: chatInput.value,
+          },
+        };
+      }
 
       // Detect @ mention typing
       const val = chatInput.value;
