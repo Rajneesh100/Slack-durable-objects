@@ -100,8 +100,8 @@ export const reduceRoom = (
       const trimmed = event.content.trim();
       const sender = state.participants.get(event.senderId);
 
-      // Validation guard
-      if (!sender || trimmed.length === 0 || trimmed.length > 4000) {
+      // Validation guard: must have content or attachment
+      if (!sender || (trimmed.length === 0 && !event.attachment)) {
         return [state, []];
       }
 
@@ -111,6 +111,8 @@ export const reduceRoom = (
         senderId: sender.userId,
         senderName: sender.username,
         content: trimmed,
+        attachment: event.attachment,
+        reactions: {},
         createdAt: event.timestamp,
       };
 
@@ -145,6 +147,24 @@ export const reduceRoom = (
       };
 
       return [nextState, effects];
+    }
+
+    case "TOGGLE_REACTION": {
+      const sender = state.participants.get(event.userId);
+      if (!sender || !event.emoji || !event.messageId) {
+        return [state, []];
+      }
+
+      const effects: readonly RoomEffect[] = [
+        {
+          type: "PERSIST_REACTION",
+          messageId: event.messageId,
+          userId: event.userId,
+          emoji: event.emoji,
+        },
+      ];
+
+      return [state, effects];
     }
 
     case "SET_TYPING": {

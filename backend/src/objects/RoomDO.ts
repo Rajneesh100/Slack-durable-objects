@@ -16,7 +16,12 @@ import type {
   ServerMessage,
   UserSession,
 } from "../domain/types";
-import { type MessageRow, mapMessageRowToChatMessage, ROOM_SCHEMA_SQL } from "../storage/room-queries";
+import {
+  type MessageRow,
+  type ReactionRow,
+  mapMessageRowToChatMessage,
+  ROOM_SCHEMA_SQL,
+} from "../storage/room-queries";
 
 export class RoomDO {
   private readonly state: DurableObjectState;
@@ -31,6 +36,13 @@ export class RoomDO {
     if (this.isInitialized && this.roomState) return;
 
     this.state.storage.sql.exec(ROOM_SCHEMA_SQL);
+
+    // Migration safe check: add attachment_json to messages if not present
+    try {
+      this.state.storage.sql.exec("ALTER TABLE messages ADD COLUMN attachment_json TEXT");
+    } catch {
+      // Column already exists, safe to ignore
+    }
 
     // Retrieve or store room metadata
     const metaRows = this.state.storage.sql
@@ -175,8 +187,19 @@ export class RoomDO {
             type: "POST_MESSAGE",
             senderId: userId,
             content: parsed.content,
+            attachment: parsed.attachment,
             messageId: "msg_" + crypto.randomUUID().slice(0, 12),
             timestamp: Date.now(),
+          });
+          break;
+        }
+
+        case "TOGGLE_REACTION": {
+          this.dispatch({
+            type: "TOGGLE_REACTION",
+            userId,
+            messageId: parsed.messageId,
+            emoji: parsed.emoji,
           });
           break;
         }
@@ -249,14 +272,59 @@ export class RoomDO {
       switch (effect.type) {
         case "PERSIST_MESSAGE": {
           this.state.storage.sql.exec(
-            "INSERT INTO messages (id, room_id, sender_id, sender_name, content, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO messages (id, room_id, sender_id, sender_name, content, attachment_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             effect.message.id,
             effect.message.roomId,
             effect.message.senderId,
             effect.message.senderName,
             effect.message.content,
+            effect.message.attachment ? JSON.stringify(effect.message.attachment) : null,
             effect.message.createdAt
           );
+          break;
+        }
+
+        case "PERSIST_REACTION": {
+          const existing = this.state.storage.sql
+            .exec(
+              "SELECT * FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?",
+              effect.messageId,
+              effect.userId,
+              effect.emoji
+            )
+            .toArray();
+
+          if (existing.length > 0) {
+            this.state.storage.sql.exec(
+              "DELETE FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?",
+              effect.messageId,
+              effect.userId,
+              effect.emoji
+            );
+          } else {
+            this.state.storage.sql.exec(
+              "INSERT INTO reactions (message_id, user_id, emoji) VALUES (?, ?, ?)",
+              effect.messageId,
+              effect.userId,
+              effect.emoji
+            );
+          }
+
+          // Broadcast updated reactions for this message to everyone
+          const allReactions = this.state.storage.sql
+            .exec("SELECT user_id FROM reactions WHERE message_id = ? AND emoji = ?", effect.messageId, effect.emoji)
+            .toArray() as { user_id: string }[];
+
+          const userIds = allReactions.map((r) => r.user_id);
+
+          const broadcastMsg: ServerMessage = {
+            type: "REACTION_UPDATED",
+            messageId: effect.messageId,
+            emoji: effect.emoji,
+            userIds,
+          };
+
+          this.executeEffects([{ type: "BROADCAST_ALL", message: broadcastMsg }]);
           break;
         }
 
@@ -305,11 +373,29 @@ export class RoomDO {
   private getRecentMessages(limit = 100): readonly ChatMessage[] {
     const rows = this.state.storage.sql
       .exec(
-        "SELECT id, room_id, sender_id, sender_name, content, created_at FROM messages ORDER BY created_at ASC LIMIT ?",
+        "SELECT id, room_id, sender_id, sender_name, content, attachment_json, created_at FROM messages ORDER BY created_at ASC LIMIT ?",
         limit
       )
       .toArray() as unknown as MessageRow[];
 
-    return rows.map(mapMessageRowToChatMessage);
+    if (rows.length === 0) return [];
+
+    const reactionRows = this.state.storage.sql
+      .exec("SELECT message_id, user_id, emoji FROM reactions")
+      .toArray() as unknown as ReactionRow[];
+
+    const reactionsMap = new Map<string, Record<string, string[]>>();
+    for (const r of reactionRows) {
+      if (!reactionsMap.has(r.message_id)) {
+        reactionsMap.set(r.message_id, {});
+      }
+      const record = reactionsMap.get(r.message_id)!;
+      if (!record[r.emoji]) {
+        record[r.emoji] = [];
+      }
+      record[r.emoji]!.push(r.user_id);
+    }
+
+    return rows.map((row) => mapMessageRowToChatMessage(row, reactionsMap.get(row.id)));
   }
 }
