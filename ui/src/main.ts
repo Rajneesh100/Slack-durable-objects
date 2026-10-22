@@ -41,6 +41,8 @@ interface ChatMessage {
   readonly attachment?: FileAttachment;
   readonly reactions?: Readonly<Record<string, readonly string[]>>; // emoji -> userIds
   readonly parentId?: string;
+  readonly parentSenderId?: string;
+  readonly parentSenderName?: string;
   readonly replyCount?: number;
   readonly lastReplyAt?: number;
   readonly createdAt: number;
@@ -50,15 +52,21 @@ interface AlertToast {
   readonly title: string;
   readonly snippet: string;
   readonly channelId: string;
+  readonly messageId?: string;
+  readonly parentId?: string;
+  readonly icon?: string;
 }
 
 interface MentionItem {
   readonly id: string;
+  readonly messageId?: string;
   readonly roomId: string;
   readonly roomName: string;
   readonly senderName: string;
   readonly content: string;
   readonly createdAt: number;
+  readonly parentId?: string;
+  readonly type?: "mention" | "thread_reply" | "reaction";
 }
 
 interface AppState {
@@ -580,12 +588,60 @@ const updateState = (updater: (prev: AppState) => AppState): void => {
   }
 };
 
-const showSlackAlertToast = (title: string, snippet: string, channelId: string): void => {
-  updateState((s) => ({ ...s, alertToast: { title, snippet, channelId } }));
+const showSlackAlertToast = (
+  title: string,
+  snippet: string,
+  channelId: string,
+  messageId?: string,
+  parentId?: string,
+  icon = "🔔"
+): void => {
+  updateState((s) => ({
+    ...s,
+    alertToast: { title, snippet, channelId, messageId, parentId, icon },
+  }));
   if (toastTimeout) clearTimeout(toastTimeout);
   toastTimeout = window.setTimeout(() => {
     updateState((s) => ({ ...s, alertToast: null }));
   }, 6000);
+};
+
+// Jump directly to exact message (or open thread) like Slack
+const navigateToMessage = async (roomId: string, messageId: string, parentId?: string): Promise<void> => {
+  updateState((s) => ({
+    ...s,
+    isViewingMentions: false,
+    alertToast: null,
+  }));
+
+  if (state.activeChannelId !== roomId) {
+    switchChannel(roomId);
+    await new Promise((r) => setTimeout(r, 220));
+  }
+
+  if (parentId) {
+    await openThread(parentId);
+    setTimeout(() => {
+      const el = document.querySelector(`[data-message-id="${messageId}"]`) as HTMLElement | null;
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        el.classList.remove("highlight-flash");
+        void el.offsetWidth;
+        el.classList.add("highlight-flash");
+      }
+    }, 160);
+  } else {
+    setTimeout(() => {
+      const el = (document.getElementById(`msg-${messageId}`) ||
+        document.querySelector(`[data-message-id="${messageId}"]`)) as HTMLElement | null;
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        el.classList.remove("highlight-flash");
+        void el.offsetWidth;
+        el.classList.add("highlight-flash");
+      }
+    }, 120);
+  }
 };
 
 // ==========================================================================
@@ -695,11 +751,14 @@ const connectWebSocket = (channelId: string, token: string): void => {
               ) {
                 snapshotMentions.push({
                   id: m.id,
+                  messageId: m.id,
                   roomId: m.roomId || channelId,
                   roomName: chName,
                   senderName: m.senderName,
                   content: m.content,
                   createdAt: m.createdAt,
+                  parentId: m.parentId,
+                  type: "mention",
                 });
               }
             }
@@ -730,29 +789,71 @@ const connectWebSocket = (channelId: string, token: string): void => {
         case "NEW_MESSAGE": {
           const msg: ChatMessage = data.message;
           const isCurrentRoom = msg.roomId === state.activeChannelId;
+          const currentUser = state.user;
+          const isFromMe = Boolean(currentUser && msg.senderId === currentUser.id);
 
-          // Check if message tags current user (@username)
+          // We ONLY notify and count if the message comes from SOMEONE ELSE!
           let isMentionForMe = false;
           let newMentionItem: MentionItem | null = null;
-          if (state.user && msg.content && state.user.id !== msg.senderId) {
-            if (isMentioningUser(msg.content, state.user.username)) {
+
+          if (currentUser && !isFromMe) {
+            const ch = state.channels.find((c) => c.id === msg.roomId);
+            const roomName = ch?.name || msg.roomId;
+
+            // 1. Tagged / Mentioned with @username
+            if (msg.content && isMentioningUser(msg.content, currentUser.username)) {
               isMentionForMe = true;
-              const ch = state.channels.find((c) => c.id === msg.roomId);
-              const roomName = ch?.name || msg.roomId;
               newMentionItem = {
                 id: msg.id,
+                messageId: msg.id,
                 roomId: msg.roomId,
                 roomName,
                 senderName: msg.senderName,
                 content: msg.content,
                 createdAt: msg.createdAt,
+                parentId: msg.parentId,
+                type: "mention",
               };
               showSlackAlertToast(
                 `@${msg.senderName} mentioned you in #${roomName}`,
                 msg.content,
-                msg.roomId
+                msg.roomId,
+                msg.id,
+                msg.parentId,
+                "🔔"
               );
               document.title = `(🔔 1) Slack — #${roomName}`;
+            }
+
+            // 2. Someone replied to your thread / message
+            const isMyThread = Boolean(
+              msg.parentId &&
+                (msg.parentSenderId === currentUser.id ||
+                  state.messages.some((m) => m.id === msg.parentId && m.senderId === currentUser.id) ||
+                  state.threadMessages.some((m) => m.id === msg.parentId && m.senderId === currentUser.id))
+            );
+
+            if (isMyThread && !isMentionForMe) {
+              newMentionItem = {
+                id: `reply_${msg.id}`,
+                messageId: msg.id,
+                roomId: msg.roomId,
+                roomName,
+                senderName: msg.senderName,
+                content: `💬 Replied to your thread: "${msg.content}"`,
+                createdAt: msg.createdAt,
+                parentId: msg.parentId,
+                type: "thread_reply",
+              };
+              showSlackAlertToast(
+                `@${msg.senderName} replied to your thread in #${roomName}`,
+                msg.content,
+                msg.roomId,
+                msg.id,
+                msg.parentId,
+                "💬"
+              );
+              document.title = `(💬 1) Slack — #${roomName}`;
             }
           }
 
@@ -761,14 +862,17 @@ const connectWebSocket = (channelId: string, token: string): void => {
             let nextUnreadMentions = s.unreadMentionsCount;
             let nextChannelMentions = s.channelMentions;
 
-            if (isMentionForMe && newMentionItem) {
-              const exists = s.mentions.some((m) => m.id === msg.id);
+            if (newMentionItem) {
+              const exists = s.mentions.some(
+                (m) => (m.messageId && m.messageId === newMentionItem!.messageId) || m.id === newMentionItem!.id
+              );
               if (!exists) {
                 nextMentions = [newMentionItem, ...s.mentions];
               }
-              // If user is currently viewing the Mentions pane, keep unread count 0.
-              // Otherwise increment so the red count highlight appears in the sidebar like Slack!
-              nextUnreadMentions = s.isViewingMentions ? 0 : s.unreadMentionsCount + 1;
+              const isLookingAtThread = s.activeThreadParentId === msg.parentId;
+              nextUnreadMentions =
+                s.isViewingMentions || isLookingAtThread ? 0 : s.unreadMentionsCount + 1;
+
               nextChannelMentions = {
                 ...s.channelMentions,
                 [msg.roomId]: true,
@@ -816,7 +920,8 @@ const connectWebSocket = (channelId: string, token: string): void => {
                 };
               }
             } else {
-              // Unread indicator for other channels
+              // Only increment unread count for other channel if NOT sent by me!
+              const unreadDelta = !isFromMe ? 1 : 0;
               return {
                 ...s,
                 mentions: nextMentions,
@@ -824,7 +929,7 @@ const connectWebSocket = (channelId: string, token: string): void => {
                 channelMentions: nextChannelMentions,
                 unreadChannels: {
                   ...s.unreadChannels,
-                  [msg.roomId]: (s.unreadChannels[msg.roomId] || 0) + 1,
+                  [msg.roomId]: (s.unreadChannels[msg.roomId] || 0) + unreadDelta,
                 },
               };
             }
@@ -841,6 +946,48 @@ const connectWebSocket = (channelId: string, token: string): void => {
         }
 
         case "REACTION_UPDATED": {
+          const isActorMe = Boolean(state.user && data.actorId === state.user.id);
+
+          const targetMsg =
+            state.messages.find((m) => m.id === data.messageId) ||
+            state.threadMessages.find((m) => m.id === data.messageId);
+
+          const isTargetMine = Boolean(
+            (data.targetSenderId && state.user && data.targetSenderId === state.user.id) ||
+            (targetMsg && state.user && targetMsg.senderId === state.user.id)
+          );
+
+          let newReactionItem: MentionItem | null = null;
+
+          if (state.user && !isActorMe && isTargetMine && data.action === "ADD") {
+            const ch = state.channels.find((c) => c.id === data.roomId);
+            const roomName = ch?.name || state.activeChannelId;
+            const actorName =
+              state.participants.find((p) => p.userId === data.actorId)?.username || "Someone";
+            const snippet = data.targetSnippet || targetMsg?.content?.slice(0, 80) || "your message";
+
+            newReactionItem = {
+              id: `react_${data.messageId}_${data.actorId}_${data.emoji}`,
+              messageId: data.messageId,
+              roomId: data.roomId || state.activeChannelId,
+              roomName,
+              senderName: actorName,
+              content: `Reacted ${data.emoji} to: "${snippet}"`,
+              createdAt: Date.now(),
+              parentId: targetMsg?.parentId,
+              type: "reaction",
+            };
+
+            showSlackAlertToast(
+              `@${actorName} reacted with ${data.emoji} to your message in #${roomName}`,
+              `"${snippet}"`,
+              data.roomId || state.activeChannelId,
+              data.messageId,
+              targetMsg?.parentId,
+              data.emoji
+            );
+          }
+
           updateState((s) => {
             const updateList = (list: readonly ChatMessage[]) =>
               list.map((m) => {
@@ -854,10 +1001,26 @@ const connectWebSocket = (channelId: string, token: string): void => {
                 return { ...m, reactions: currentReactions };
               });
 
+            let nextMentions = s.mentions;
+            let nextUnreadMentions = s.unreadMentionsCount;
+
+            if (newReactionItem) {
+              const exists = s.mentions.some((m) => m.id === newReactionItem!.id);
+              if (!exists) {
+                nextMentions = [newReactionItem, ...s.mentions];
+              }
+              nextUnreadMentions = s.isViewingMentions ? 0 : s.unreadMentionsCount + 1;
+              if (s.user) {
+                savePersistedMentions(s.user.id, nextMentions, nextUnreadMentions);
+              }
+            }
+
             return {
               ...s,
               messages: updateList(s.messages),
               threadMessages: updateList(s.threadMessages),
+              mentions: nextMentions,
+              unreadMentionsCount: nextUnreadMentions,
             };
           });
           break;
@@ -1900,12 +2063,13 @@ const renderMentionsPane = (): string => `
     ${
       state.alertToast
         ? `
-        <div class="slack-alert-toast" id="slack-alert-banner" data-channel-id="${state.alertToast.channelId}">
-          <div class="slack-alert-icon">🔔</div>
+        <div class="slack-alert-toast" id="slack-alert-banner" data-channel-id="${state.alertToast.channelId}" data-message-id="${state.alertToast.messageId || ""}" data-parent-id="${state.alertToast.parentId || ""}">
+          <div class="slack-alert-icon">${state.alertToast.icon || "🔔"}</div>
           <div class="slack-alert-content">
             <span class="slack-alert-title">${escapeHtml(state.alertToast.title)}</span>
             <span class="slack-alert-snippet">${escapeHtml(state.alertToast.snippet)}</span>
           </div>
+          <button type="button" class="slack-alert-close" id="close-alert-toast" title="Dismiss">&times;</button>
         </div>
       `
         : ""
@@ -1927,9 +2091,10 @@ const renderMentionsPane = (): string => `
           : state.mentions
               .map(
                 (m) => `
-          <div class="mention-card" data-channel-id="${m.roomId}">
+          <div class="mention-card" data-channel-id="${m.roomId}" data-message-id="${m.messageId || m.id}" data-parent-id="${m.parentId || ""}">
             <div class="mention-card-meta">
               <span class="mention-card-channel">#${escapeHtml(m.roomName)}</span>
+              <span class="mention-card-badge ${m.type || "mention"}">${m.type === "thread_reply" ? "Thread reply" : m.type === "reaction" ? "Reaction" : "Mention"}</span>
               <span class="mention-card-time">${formatRelativeTime(m.createdAt)}</span>
             </div>
             <div class="mention-card-header">
@@ -2078,12 +2243,13 @@ const renderSlackApp = (): string => {
         ${
           state.alertToast
             ? `
-            <div class="slack-alert-toast" id="slack-alert-banner" data-channel-id="${state.alertToast.channelId}">
-              <div class="slack-alert-icon">🔔</div>
+            <div class="slack-alert-toast" id="slack-alert-banner" data-channel-id="${state.alertToast.channelId}" data-message-id="${state.alertToast.messageId || ""}" data-parent-id="${state.alertToast.parentId || ""}">
+              <div class="slack-alert-icon">${state.alertToast.icon || "🔔"}</div>
               <div class="slack-alert-content">
                 <span class="slack-alert-title">${escapeHtml(state.alertToast.title)}</span>
                 <span class="slack-alert-snippet">${escapeHtml(state.alertToast.snippet)}</span>
               </div>
+              <button type="button" class="slack-alert-close" id="close-alert-toast" title="Dismiss">&times;</button>
             </div>
           `
             : ""
@@ -2420,12 +2586,18 @@ const bindEvents = (): void => {
     };
   }
 
-  // Mention Cards in Mentions Pane
+  // Mention Cards in Mentions Pane: Jump directly to message or open thread!
   const mentionCards = document.querySelectorAll<HTMLElement>(".mention-card");
   mentionCards.forEach((card) => {
     card.onclick = () => {
       const chId = card.getAttribute("data-channel-id");
-      if (chId) switchChannel(chId);
+      const msgId = card.getAttribute("data-message-id");
+      const parentId = card.getAttribute("data-parent-id") || undefined;
+      if (chId && msgId) {
+        navigateToMessage(chId, msgId, parentId);
+      } else if (chId) {
+        switchChannel(chId);
+      }
     };
   });
 
@@ -2449,12 +2621,22 @@ const bindEvents = (): void => {
     };
   });
 
-  // Alert Banner Click to switch channel
+  // Alert Banner Click to jump directly to message/thread or dismiss
   const alertBanner = document.getElementById("slack-alert-banner");
   if (alertBanner) {
-    alertBanner.onclick = () => {
+    alertBanner.onclick = (e) => {
+      if ((e.target as HTMLElement).closest(".slack-alert-close")) {
+        updateState((s) => ({ ...s, alertToast: null }));
+        return;
+      }
       const chId = alertBanner.getAttribute("data-channel-id");
-      if (chId) switchChannel(chId);
+      const msgId = alertBanner.getAttribute("data-message-id") || undefined;
+      const parentId = alertBanner.getAttribute("data-parent-id") || undefined;
+      if (chId && msgId) {
+        navigateToMessage(chId, msgId, parentId);
+      } else if (chId) {
+        switchChannel(chId);
+      }
       updateState((s) => ({ ...s, alertToast: null }));
     };
   }
@@ -2816,7 +2998,7 @@ const pollChannelActivity = async (): Promise<void> => {
 
       const lastRead = lastReadTimestamps[roomId] || 0;
       if (act.lastMessageAt > lastRead) {
-        if (!nextUnread[roomId]) {
+        if (!nextUnread[roomId] && act.lastSender !== state.user.username) {
           nextUnread[roomId] = 1;
           hasChange = true;
         }

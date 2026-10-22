@@ -302,6 +302,24 @@ export class RoomDO {
 
       switch (parsed.type) {
         case "SEND_MESSAGE": {
+          let parentSenderId: string | undefined = undefined;
+          let parentSenderName: string | undefined = undefined;
+          if (parsed.parentId) {
+            if (this.messageCache.has(parsed.parentId)) {
+              const p = this.messageCache.get(parsed.parentId)!;
+              parentSenderId = p.senderId;
+              parentSenderName = p.senderName;
+            } else {
+              const rows = this.state.storage.sql
+                .exec("SELECT sender_id, sender_name FROM messages WHERE id = ?", parsed.parentId)
+                .toArray() as { sender_id: string; sender_name: string }[];
+              if (rows.length > 0 && rows[0]) {
+                parentSenderId = rows[0].sender_id;
+                parentSenderName = rows[0].sender_name;
+              }
+            }
+          }
+
           this.dispatch({
             type: "POST_MESSAGE",
             senderId: userId,
@@ -309,6 +327,8 @@ export class RoomDO {
             attachment: parsed.attachment,
             messageId: "msg_" + crypto.randomUUID().slice(0, 12),
             parentId: parsed.parentId,
+            parentSenderId,
+            parentSenderName,
             timestamp: Date.now(),
           });
           break;
@@ -469,16 +489,17 @@ export class RoomDO {
             )
             .toArray();
 
-          if (existing.length > 0) {
+          const isAdded = existing.length === 0;
+          if (isAdded) {
             this.state.storage.sql.exec(
-              "DELETE FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?",
+              "INSERT INTO reactions (message_id, user_id, emoji) VALUES (?, ?, ?)",
               effect.messageId,
               effect.userId,
               effect.emoji
             );
           } else {
             this.state.storage.sql.exec(
-              "INSERT INTO reactions (message_id, user_id, emoji) VALUES (?, ?, ?)",
+              "DELETE FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?",
               effect.messageId,
               effect.userId,
               effect.emoji
@@ -491,9 +512,15 @@ export class RoomDO {
 
           const userIds = allReactions.map((r) => r.user_id);
 
-          // Keep in-memory cache updated
+          // Find target message sender and snippet
+          let targetSenderId: string | undefined;
+          let targetSenderName: string | undefined;
+          let targetSnippet: string | undefined;
           if (this.messageCache.has(effect.messageId)) {
             const cached = this.messageCache.get(effect.messageId)!;
+            targetSenderId = cached.senderId;
+            targetSenderName = cached.senderName;
+            targetSnippet = cached.content;
             const updatedReactions = { ...(cached.reactions || {}) };
             if (userIds.length > 0) {
               updatedReactions[effect.emoji] = userIds;
@@ -501,6 +528,14 @@ export class RoomDO {
               delete updatedReactions[effect.emoji];
             }
             this.messageCache.set(effect.messageId, { ...cached, reactions: updatedReactions });
+          } else {
+            const rows = this.state.storage.sql
+              .exec("SELECT sender_id, sender_name FROM messages WHERE id = ?", effect.messageId)
+              .toArray() as { sender_id: string; sender_name: string }[];
+            if (rows.length > 0 && rows[0]) {
+              targetSenderId = rows[0].sender_id;
+              targetSenderName = rows[0].sender_name;
+            }
           }
 
           const broadcastMsg: ServerMessage = {
@@ -508,6 +543,12 @@ export class RoomDO {
             messageId: effect.messageId,
             emoji: effect.emoji,
             userIds,
+            actorId: effect.userId,
+            action: isAdded ? "ADD" : "REMOVE",
+            targetSenderId,
+            targetSenderName,
+            targetSnippet: targetSnippet ? targetSnippet.slice(0, 80) : undefined,
+            roomId: this.roomState?.roomId || "",
           };
 
           this.executeEffects([{ type: "BROADCAST_ALL", message: broadcastMsg }]);

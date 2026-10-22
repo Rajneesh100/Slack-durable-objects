@@ -114,6 +114,8 @@ export const reduceRoom = (
         attachment: event.attachment,
         reactions: {},
         parentId: event.parentId,
+        parentSenderId: event.parentSenderId,
+        parentSenderName: event.parentSenderName,
         createdAt: event.timestamp,
       };
 

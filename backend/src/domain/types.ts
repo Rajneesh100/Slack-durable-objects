@@ -46,6 +46,8 @@ export interface ChatMessage {
   readonly attachment?: FileAttachment;
   readonly reactions?: Readonly<Record<string, readonly UserId[]>>; // emoji -> array of userIds
   readonly parentId?: MessageId; // For Slack thread replies
+  readonly parentSenderId?: UserId; // Author of the root thread message
+  readonly parentSenderName?: string;
   readonly replyCount?: number;  // Total thread replies for top-level message
   readonly lastReplyAt?: number; // Latest thread reply timestamp
   readonly createdAt: number;
@@ -83,7 +85,18 @@ export type ServerMessage =
       readonly messages: readonly ChatMessage[];
     }
   | { readonly type: "NEW_MESSAGE"; readonly message: ChatMessage }
-  | { readonly type: "REACTION_UPDATED"; readonly messageId: MessageId; readonly emoji: string; readonly userIds: readonly UserId[] }
+  | {
+      readonly type: "REACTION_UPDATED";
+      readonly messageId: MessageId;
+      readonly emoji: string;
+      readonly userIds: readonly UserId[];
+      readonly actorId?: UserId;
+      readonly action?: "ADD" | "REMOVE";
+      readonly targetSenderId?: UserId;
+      readonly targetSenderName?: string;
+      readonly targetSnippet?: string;
+      readonly roomId?: RoomId;
+    }
   | { readonly type: "USER_JOINED"; readonly participant: Participant }
   | { readonly type: "USER_LEFT"; readonly userId: UserId }
   | { readonly type: "TYPING_INDICATOR"; readonly typingUsers: readonly string[] }
@@ -101,6 +114,8 @@ export type RoomDomainEvent =
       readonly attachment?: FileAttachment;
       readonly messageId: MessageId;
       readonly parentId?: MessageId;
+      readonly parentSenderId?: UserId;
+      readonly parentSenderName?: string;
       readonly timestamp: number;
     }
   | {
