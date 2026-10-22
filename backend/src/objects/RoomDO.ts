@@ -45,7 +45,7 @@ export class RoomDO {
     this.env = env;
   }
 
-  private async ensureInitialized(roomId: string, name?: string, inviteCode?: string): Promise<void> {
+  private async ensureInitialized(roomId?: string, name?: string, inviteCode?: string): Promise<void> {
     if (this.isInitialized && this.roomState && this.cryptoKey) return;
 
     this.state.storage.sql.exec(ROOM_SCHEMA_SQL);
@@ -78,28 +78,30 @@ export class RoomDO {
       this.state.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_room_members_user ON room_members(user_id)");
     } catch {}
 
-    // Derive deterministic AES-256-GCM key for this room
-    this.cryptoKey = await deriveRoomKey(roomId);
-
     // Retrieve or store room metadata
     const metaRows = this.state.storage.sql
       .exec("SELECT key, value FROM room_metadata")
       .toArray() as unknown as { key: string; value: string }[];
 
     const metaMap = new Map(metaRows.map((r) => [r.key, r.value]));
-    const roomName = name || metaMap.get("name") || roomId;
-    const roomInvite = inviteCode || metaMap.get("inviteCode") || roomId;
+    const effectiveRoomId = roomId || metaMap.get("roomId") || "general";
+    const roomName = name || metaMap.get("name") || effectiveRoomId;
+    const roomInvite = inviteCode || metaMap.get("inviteCode") || effectiveRoomId;
 
-    if (!metaMap.has("name")) {
+    if (!metaMap.has("roomId") || !metaMap.has("name")) {
       this.state.storage.sql.exec(
-        "INSERT OR REPLACE INTO room_metadata (key, value) VALUES ('name', ?), ('inviteCode', ?)",
+        "INSERT OR REPLACE INTO room_metadata (key, value) VALUES ('roomId', ?), ('name', ?), ('inviteCode', ?)",
+        effectiveRoomId,
         roomName,
         roomInvite
       );
     }
 
+    // Derive deterministic AES-256-GCM key for this room
+    this.cryptoKey = await deriveRoomKey(effectiveRoomId);
+
     // Reconstruct in-memory state
-    this.roomState = initialRoomState(roomId, roomName, roomInvite);
+    this.roomState = initialRoomState(effectiveRoomId, roomName, roomInvite);
 
     // Check existing hibernated WebSockets
     const activeSockets = this.state.getWebSockets();
@@ -297,6 +299,9 @@ export class RoomDO {
     const userId = tags[0];
     if (!userId) return;
 
+    // Wakeup Guarantee: Ensure state and AES-GCM crypto key are initialized even if waking directly from hibernation
+    await this.ensureInitialized();
+
     try {
       const parsed = JSON.parse(message) as ClientMessage;
 
@@ -325,7 +330,7 @@ export class RoomDO {
             senderId: userId,
             content: parsed.content,
             attachment: parsed.attachment,
-            messageId: "msg_" + crypto.randomUUID().slice(0, 12),
+            messageId: parsed.tempId || ("msg_" + crypto.randomUUID().slice(0, 12)),
             parentId: parsed.parentId,
             parentSenderId,
             parentSenderName,
@@ -370,6 +375,7 @@ export class RoomDO {
   }
 
   async webSocketClose(ws: WebSocket): Promise<void> {
+    await this.ensureInitialized();
     const tags = this.state.getTags(ws);
     const userId = tags[0];
     if (!userId) return;
@@ -388,6 +394,7 @@ export class RoomDO {
   }
 
   async alarm(): Promise<void> {
+    await this.ensureInitialized();
     this.dispatch({
       type: "PRUNE_TYPING",
       currentTimestamp: Date.now(),

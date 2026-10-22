@@ -376,6 +376,26 @@ const savePersistedMentions = (
   } catch {}
 };
 
+const loadPersistedLastRead = (userId: string | null): Record<string, number> => {
+  if (!userId) return {};
+  try {
+    const raw = localStorage.getItem(`slack_last_read_${userId}`);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+};
+
+const savePersistedLastRead = (
+  userId: string | null,
+  timestamps: Record<string, number>
+): void => {
+  if (!userId) return;
+  try {
+    localStorage.setItem(`slack_last_read_${userId}`, JSON.stringify(timestamps));
+  } catch {}
+};
+
 const isMentioningUser = (content: string, username: string): boolean => {
   if (!content || !username) return false;
   const escaped = username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -455,7 +475,7 @@ let reconnectAttempts = 0;
 let lastTypingSent = 0;
 let lastPongReceivedAt = Date.now();
 let activityPollInterval: number | null = null;
-let lastReadTimestamps: Record<string, number> = {};
+let lastReadTimestamps: Record<string, number> = loadPersistedLastRead(initialAuth.user?.id || null);
 let isInternalHashChange = false;
 let pendingOutbox: OutboxMessage[] = [];
 
@@ -464,8 +484,8 @@ const startHeartbeat = (): void => {
   heartbeatInterval = window.setInterval(() => {
     const now = Date.now();
     if (activeSocket && activeSocket.readyState === WebSocket.OPEN) {
-      if (now - lastPongReceivedAt > 30000) {
-        console.warn("WebSocket heartbeat timed out (>30s no pong), reconnecting...");
+      if (now - lastPongReceivedAt > 20000) {
+        console.warn("WebSocket heartbeat timed out (>20s no pong), reconnecting...");
         checkAndHealWebSocket();
         return;
       }
@@ -478,7 +498,7 @@ const startHeartbeat = (): void => {
     } else {
       checkAndHealWebSocket();
     }
-  }, 15000); // 15s keeps Cloudflare DO alive and detects drops fast
+  }, 10000); // 10s keeps Cloudflare DO alive and detects drops fast
 };
 
 const stopHeartbeat = (): void => {
@@ -503,7 +523,7 @@ const scheduleReconnect = (channelId: string, token: string): void => {
 const checkAndHealWebSocket = (): void => {
   if (!state.user || !state.token || state.isChannelForbidden) return;
   const now = Date.now();
-  const isStale = now - lastPongReceivedAt > 22000;
+  const isStale = now - lastPongReceivedAt > 15000;
   const isDead = !activeSocket || activeSocket.readyState === WebSocket.CLOSED || activeSocket.readyState === WebSocket.CLOSING;
 
   if (isDead || isStale) {
@@ -709,12 +729,15 @@ const connectWebSocket = (channelId: string, token: string): void => {
                 content: m.content,
                 attachment: m.attachment,
                 parentId: m.parentId,
+                tempId: m.clientMsgId,
               })
             );
           } catch (err) {
             console.error("Error flushing message:", err);
             pendingOutbox.push(m);
           }
+        } else {
+          pendingOutbox.push(m);
         }
       }
     }
@@ -736,6 +759,9 @@ const connectWebSocket = (channelId: string, token: string): void => {
 
         case "ROOM_SNAPSHOT": {
           lastReadTimestamps[channelId] = Date.now();
+          if (state.user) {
+            savePersistedLastRead(state.user.id, lastReadTimestamps);
+          }
           const snapshotMsgs: ChatMessage[] = data.messages || [];
 
           // Scan snapshot messages for any mentions of current user
@@ -775,9 +801,16 @@ const connectWebSocket = (channelId: string, token: string): void => {
               savePersistedMentions(s.user.id, mergedMentions, s.unreadMentionsCount);
             }
 
+            // Preserve any pending optimistic messages that haven't landed in SQLite yet
+            const snapshotIds = new Set(snapshotMsgs.map((m) => m.id));
+            const pendingOptimistic = s.messages.filter(
+              (m) => pendingOutbox.some((p) => p.clientMsgId === m.id) && !snapshotIds.has(m.id)
+            );
+            const mergedMsgs = [...snapshotMsgs, ...pendingOptimistic];
+
             return {
               ...s,
-              messages: snapshotMsgs,
+              messages: mergedMsgs,
               participants: data.participants || [],
               mentions: mergedMentions,
             };
@@ -883,10 +916,18 @@ const connectWebSocket = (channelId: string, token: string): void => {
             }
 
             if (isCurrentRoom) {
+              lastReadTimestamps[msg.roomId] = Date.now();
+              if (s.user) {
+                savePersistedLastRead(s.user.id, lastReadTimestamps);
+              }
+
               if (msg.parentId) {
                 // Thread reply: update active thread and increment parent's replyCount
                 const isMatchingActiveThread = s.activeThreadParentId === msg.parentId;
-                const nextThreadMessages = isMatchingActiveThread
+                const existsInThread = s.threadMessages.some((m) => m.id === msg.id);
+                const nextThreadMessages = existsInThread
+                  ? s.threadMessages.map((m) => (m.id === msg.id ? msg : m))
+                  : isMatchingActiveThread
                   ? [...s.threadMessages, msg]
                   : s.threadMessages;
 
@@ -910,13 +951,18 @@ const connectWebSocket = (channelId: string, token: string): void => {
                   threadMessages: nextThreadMessages,
                 };
               } else {
-                // Top-level channel message
+                // Top-level channel message: deduplicate optimistic message by id
+                const exists = s.messages.some((m) => m.id === msg.id);
+                const nextMessages = exists
+                  ? s.messages.map((m) => (m.id === msg.id ? msg : m))
+                  : [...s.messages, msg];
+
                 return {
                   ...s,
                   mentions: nextMentions,
                   unreadMentionsCount: nextUnreadMentions,
                   channelMentions: nextChannelMentions,
-                  messages: [...s.messages, msg],
+                  messages: nextMessages,
                 };
               }
             } else {
@@ -1099,16 +1145,56 @@ const sendChatMessage = (content: string, parentId?: string): void => {
     sentAt: Date.now(),
   };
 
-  const isStale = Date.now() - lastPongReceivedAt > 22000;
+  const currentUser = state.user;
+  const optimisticMsg: ChatMessage = {
+    id: clientMsgId,
+    roomId: state.activeChannelId,
+    senderId: currentUser?.id || "me",
+    senderName: currentUser?.username || "You",
+    content: trimmed,
+    attachment: attachment || undefined,
+    parentId,
+    createdAt: Date.now(),
+  };
 
-  if (activeSocket && activeSocket.readyState === WebSocket.OPEN && !isStale) {
+  // Immediate optimistic update so user sees message instantly without waiting
+  if (parentId) {
+    updateState((s) => ({
+      ...s,
+      threadMessages: [...s.threadMessages, optimisticMsg],
+      messages: s.messages.map((m) =>
+        m.id === parentId
+          ? { ...m, replyCount: (m.replyCount || 0) + 1, lastReplyAt: Date.now() }
+          : m
+      ),
+    }));
+    scrollThreadToBottom();
+  } else {
+    updateState((s) => ({
+      ...s,
+      messages: [...s.messages, optimisticMsg],
+    }));
+    scrollChatToBottom();
+  }
+
+  // Active channel read status kept up to date
+  lastReadTimestamps[state.activeChannelId] = Date.now();
+  if (currentUser) {
+    savePersistedLastRead(currentUser.id, lastReadTimestamps);
+  }
+
+  const isStale = Date.now() - lastPongReceivedAt > 15000;
+  const isOpen = Boolean(activeSocket && activeSocket.readyState === WebSocket.OPEN);
+
+  if (isOpen && !isStale) {
     try {
-      activeSocket.send(
+      activeSocket!.send(
         JSON.stringify({
           type: "SEND_MESSAGE",
           content: trimmed,
           attachment: attachment || undefined,
           parentId,
+          tempId: clientMsgId,
         })
       );
     } catch (err) {
@@ -1118,7 +1204,7 @@ const sendChatMessage = (content: string, parentId?: string): void => {
     }
   } else {
     pendingOutbox.push(outboxItem);
-    checkAndHealWebSocket();
+    connectWebSocket(state.activeChannelId, state.token || "");
   }
 
   if (parentId) {
@@ -1586,6 +1672,9 @@ const switchChannel = (channelId: string): void => {
   const nextChannelMentions = { ...state.channelMentions };
   delete nextChannelMentions[channelId];
   lastReadTimestamps[channelId] = Date.now();
+  if (state.user) {
+    savePersistedLastRead(state.user.id, lastReadTimestamps);
+  }
 
   document.title = "Slack — Durable Objects";
   isInternalHashChange = true;
@@ -1641,6 +1730,9 @@ const checkHashRoute = (): void => {
     const nextChannelMentions = { ...state.channelMentions };
     delete nextChannelMentions[channelId];
     lastReadTimestamps[channelId] = Date.now();
+    if (state.user) {
+      savePersistedLastRead(state.user.id, lastReadTimestamps);
+    }
 
     updateState((s) => ({
       ...s,
@@ -2537,6 +2629,7 @@ const bindEvents = (): void => {
         reconnectTimeout = null;
       }
       pendingOutbox = [];
+      lastReadTimestamps = {};
       clearPersistedAuth();
       if (activeSocket) {
         activeSocket.onclose = null;
@@ -2741,6 +2834,12 @@ const bindEvents = (): void => {
       submitThreadMessage();
     };
 
+    threadChatInput.onfocus = () => {
+      if (Date.now() - lastPongReceivedAt > 12000 || !activeSocket || activeSocket.readyState !== WebSocket.OPEN) {
+        checkAndHealWebSocket();
+      }
+    };
+
     threadChatInput.onkeydown = (e) => {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
@@ -2926,6 +3025,12 @@ const bindEvents = (): void => {
       submitCurrentMessage();
     };
 
+    chatInput.onfocus = () => {
+      if (Date.now() - lastPongReceivedAt > 12000 || !activeSocket || activeSocket.readyState !== WebSocket.OPEN) {
+        checkAndHealWebSocket();
+      }
+    };
+
     chatInput.onkeydown = (e) => {
       // ENTER sends the message + attachment! (Shift + Enter for new lines)
       if (e.key === "Enter" && !e.shiftKey) {
@@ -2994,7 +3099,24 @@ const pollChannelActivity = async (): Promise<void> => {
     const nextMentionsList = [...state.mentions];
 
     for (const [roomId, act] of Object.entries(activities)) {
-      if (roomId === state.activeChannelId) continue;
+      if (roomId === state.activeChannelId) {
+        if ((lastReadTimestamps[roomId] || 0) < act.lastMessageAt) {
+          lastReadTimestamps[roomId] = Math.max(act.lastMessageAt, Date.now());
+          if (state.user) {
+            savePersistedLastRead(state.user.id, lastReadTimestamps);
+          }
+        }
+        continue;
+      }
+
+      // If channel was never tracked for this user, seed it with act.lastMessageAt
+      // so past messages from before the user joined/refreshed never trigger fake unreads!
+      if (lastReadTimestamps[roomId] === undefined) {
+        lastReadTimestamps[roomId] = act.lastMessageAt;
+        if (state.user) {
+          savePersistedLastRead(state.user.id, lastReadTimestamps);
+        }
+      }
 
       const lastRead = lastReadTimestamps[roomId] || 0;
       if (act.lastMessageAt > lastRead) {
@@ -3085,6 +3207,7 @@ const init = async (): Promise<void> => {
   activityPollInterval = window.setInterval(pollChannelActivity, 4000);
 
   if (state.user && state.token) {
+    lastReadTimestamps = loadPersistedLastRead(state.user.id);
     await fetchUserProfile(state.user.id);
     checkHashRoute();
     pollChannelActivity();
