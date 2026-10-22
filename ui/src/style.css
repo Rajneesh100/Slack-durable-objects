@@ -283,6 +283,17 @@ html, body {
   height: 7px;
   border-radius: var(--radius-full);
   background-color: var(--accent-green);
+  transition: background-color var(--transition-fast);
+}
+
+.pulse-dot.reconnecting {
+  background-color: var(--accent-yellow);
+  animation: pulse-glow 1s infinite alternate;
+}
+
+@keyframes pulse-glow {
+  0% { opacity: 0.35; transform: scale(0.85); }
+  100% { opacity: 1; transform: scale(1.15); }
 }
 
 .sidebar-content {

@@ -71,7 +71,8 @@ export type ClientMessage =
   | { readonly type: "JOIN"; readonly token: string }
   | { readonly type: "SEND_MESSAGE"; readonly content: string; readonly attachment?: FileAttachment; readonly parentId?: MessageId; readonly tempId?: string }
   | { readonly type: "TOGGLE_REACTION"; readonly messageId: MessageId; readonly emoji: string }
-  | { readonly type: "TYPING"; readonly isTyping: boolean };
+  | { readonly type: "TYPING"; readonly isTyping: boolean }
+  | { readonly type: "PING" };
 
 // Server to Client WebSocket Protocol
 export type ServerMessage =
@@ -86,7 +87,8 @@ export type ServerMessage =
   | { readonly type: "USER_JOINED"; readonly participant: Participant }
   | { readonly type: "USER_LEFT"; readonly userId: UserId }
   | { readonly type: "TYPING_INDICATOR"; readonly typingUsers: readonly string[] }
-  | { readonly type: "ERROR"; readonly message: string };
+  | { readonly type: "ERROR"; readonly message: string }
+  | { readonly type: "PONG" };
 
 // Domain Events (Inputs to the Pure Reducer)
 export type RoomDomainEvent =

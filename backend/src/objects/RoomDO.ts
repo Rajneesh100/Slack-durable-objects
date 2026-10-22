@@ -325,6 +325,11 @@ export class RoomDO {
           }
           break;
         }
+
+        case "PING": {
+          ws.send(JSON.stringify({ type: "PONG" }));
+          break;
+        }
       }
     } catch {
       ws.send(JSON.stringify({ type: "ERROR", message: "Malformed JSON message" }));

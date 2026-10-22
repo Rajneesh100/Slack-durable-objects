@@ -377,10 +377,62 @@ let state: AppState = {
   drafts: {},
 };
 
+interface OutboxMessage {
+  readonly content: string;
+  readonly attachment?: FileAttachment;
+  readonly parentId?: string;
+}
+
 let activeSocket: WebSocket | null = null;
 let typingDebounceTimer: number | null = null;
 let toastTimeout: number | null = null;
+let heartbeatInterval: number | null = null;
+let reconnectTimeout: number | null = null;
+let reconnectAttempts = 0;
 let lastTypingSent = 0;
+let pendingOutbox: OutboxMessage[] = [];
+
+const startHeartbeat = (): void => {
+  if (heartbeatInterval) clearInterval(heartbeatInterval);
+  heartbeatInterval = window.setInterval(() => {
+    if (activeSocket && activeSocket.readyState === WebSocket.OPEN) {
+      try {
+        activeSocket.send(JSON.stringify({ type: "PING" }));
+      } catch (err) {
+        console.warn("Heartbeat send error, triggering reconnect:", err);
+        ensureWebSocketConnected();
+      }
+    } else if (!activeSocket || activeSocket.readyState === WebSocket.CLOSED) {
+      ensureWebSocketConnected();
+    }
+  }, 20000); // 20s avoids Cloudflare 100s idle timeout
+};
+
+const stopHeartbeat = (): void => {
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+  }
+};
+
+const scheduleReconnect = (channelId: string, token: string): void => {
+  if (reconnectTimeout) clearTimeout(reconnectTimeout);
+  if (!state.user || !state.token || state.isChannelForbidden) return;
+
+  const delay = Math.min(1000 * Math.pow(1.5, reconnectAttempts), 8000);
+  reconnectAttempts++;
+
+  reconnectTimeout = window.setTimeout(() => {
+    connectWebSocket(channelId, token);
+  }, delay);
+};
+
+const ensureWebSocketConnected = (): void => {
+  if (!state.user || !state.token || state.isChannelForbidden) return;
+  if (!activeSocket || activeSocket.readyState === WebSocket.CLOSED || activeSocket.readyState === WebSocket.CLOSING) {
+    connectWebSocket(state.activeChannelId, state.token);
+  }
+};
 
 // Update state and trigger re-render while NEVER losing user's typed drafts
 const updateState = (updater: (prev: AppState) => AppState): void => {
@@ -433,8 +485,14 @@ const showSlackAlertToast = (title: string, snippet: string, channelId: string):
 // ==========================================================================
 
 const connectWebSocket = (channelId: string, token: string): void => {
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
+
   if (activeSocket) {
     activeSocket.onclose = null;
+    activeSocket.onerror = null;
     activeSocket.close();
     activeSocket = null;
   }
@@ -444,7 +502,7 @@ const connectWebSocket = (channelId: string, token: string): void => {
   const isMember = isPublic || state.channels.some((c) => c.id === channelId);
 
   if (!isMember && state.channels.length > 0) {
-    // Channel is private and user is not an approved member!
+    stopHeartbeat();
     updateState((s) => ({
       ...s,
       isChannelForbidden: true,
@@ -460,9 +518,6 @@ const connectWebSocket = (channelId: string, token: string): void => {
     ...s,
     isChannelForbidden: false,
     isConnecting: true,
-    messages: [],
-    participants: [],
-    typingUsers: [],
   }));
 
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -472,7 +527,30 @@ const connectWebSocket = (channelId: string, token: string): void => {
   activeSocket = ws;
 
   ws.onopen = () => {
+    reconnectAttempts = 0;
+    startHeartbeat();
     updateState((s) => ({ ...s, isConnecting: false, isChannelForbidden: false }));
+
+    // Flush any pending messages that user submitted while reconnecting
+    if (pendingOutbox.length > 0) {
+      const messagesToSend = [...pendingOutbox];
+      pendingOutbox = [];
+      for (const m of messagesToSend) {
+        try {
+          ws.send(
+            JSON.stringify({
+              type: "SEND_MESSAGE",
+              content: m.content,
+              attachment: m.attachment,
+              parentId: m.parentId,
+            })
+          );
+        } catch (err) {
+          console.error("Error flushing message:", err);
+          pendingOutbox.push(m);
+        }
+      }
+    }
   };
 
   ws.onmessage = (event) => {
@@ -480,6 +558,11 @@ const connectWebSocket = (channelId: string, token: string): void => {
       const data = JSON.parse(event.data);
 
       switch (data.type) {
+        case "PONG": {
+          // Heartbeat ack from Durable Object
+          break;
+        }
+
         case "ROOM_SNAPSHOT": {
           updateState((s) => ({
             ...s,
@@ -619,37 +702,52 @@ const connectWebSocket = (channelId: string, token: string): void => {
   };
 
   ws.onclose = (event) => {
+    stopHeartbeat();
     if (event.code === 4403 || event.code === 1008 || (!isPublic && !state.channels.some((c) => c.id === channelId))) {
       updateState((s) => ({ ...s, isConnecting: false, isChannelForbidden: true }));
     } else {
-      updateState((s) => ({ ...s, isConnecting: false }));
+      updateState((s) => ({ ...s, isConnecting: true }));
+      scheduleReconnect(channelId, token);
     }
   };
 
   ws.onerror = (e) => {
-    console.error("WebSocket error:", e);
+    console.warn("WebSocket error:", e);
+    stopHeartbeat();
     if (!isPublic && !state.channels.some((c) => c.id === channelId)) {
       updateState((s) => ({ ...s, isConnecting: false, isChannelForbidden: true }));
     } else {
-      updateState((s) => ({ ...s, isConnecting: false }));
+      updateState((s) => ({ ...s, isConnecting: true }));
+      scheduleReconnect(channelId, token);
     }
   };
 };
 
 const sendChatMessage = (content: string, parentId?: string): void => {
-  if (!activeSocket || activeSocket.readyState !== WebSocket.OPEN) return;
   const trimmed = content.trim();
   const attachment = parentId ? state.threadPendingAttachment : state.pendingAttachment;
   if (trimmed.length === 0 && !attachment) return;
 
-  activeSocket.send(
-    JSON.stringify({
-      type: "SEND_MESSAGE",
-      content: trimmed,
-      attachment: attachment || undefined,
-      parentId,
-    })
-  );
+  const payload = {
+    type: "SEND_MESSAGE",
+    content: trimmed,
+    attachment: attachment || undefined,
+    parentId,
+  };
+
+  // If connected, transmit immediately; otherwise queue into outbox so message is NEVER lost!
+  if (activeSocket && activeSocket.readyState === WebSocket.OPEN) {
+    try {
+      activeSocket.send(JSON.stringify(payload));
+    } catch (err) {
+      console.warn("Socket send failed, queueing message in outbox:", err);
+      pendingOutbox.push({ content: trimmed, attachment: attachment || undefined, parentId });
+      ensureWebSocketConnected();
+    }
+  } else {
+    pendingOutbox.push({ content: trimmed, attachment: attachment || undefined, parentId });
+    ensureWebSocketConnected();
+  }
 
   if (parentId) {
     const nextDrafts = { ...state.drafts };
@@ -1579,7 +1677,11 @@ const renderSlackApp = (): string => {
             <div class="workspace-logo-badge">#</div>
             <div class="workspace-info">
               <h2>Slack DO</h2>
-              <span><span class="pulse-dot"></span> Online</span>
+              ${
+                state.isConnecting
+                  ? `<span><span class="pulse-dot reconnecting"></span> Reconnecting...</span>`
+                  : `<span><span class="pulse-dot"></span> Online</span>`
+              }
             </div>
           </div>
         </div>
@@ -1928,8 +2030,16 @@ const bindEvents = (): void => {
   const logoutBtn = document.getElementById("logout-btn");
   if (logoutBtn) {
     logoutBtn.onclick = () => {
+      stopHeartbeat();
+      if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
+      }
+      pendingOutbox = [];
       clearPersistedAuth();
       if (activeSocket) {
+        activeSocket.onclose = null;
+        activeSocket.onerror = null;
         activeSocket.close();
         activeSocket = null;
       }
@@ -2315,6 +2425,22 @@ const renderApp = (): void => {
 
 const init = async (): Promise<void> => {
   window.addEventListener("hashchange", checkHashRoute);
+
+  // Resume WebSocket connection immediately if browser tab was idle, backgrounded, or wake-from-sleep
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      ensureWebSocketConnected();
+    }
+  });
+
+  window.addEventListener("focus", () => {
+    ensureWebSocketConnected();
+  });
+
+  window.addEventListener("online", () => {
+    ensureWebSocketConnected();
+  });
+
   renderApp();
 
   if (state.user && state.token) {
